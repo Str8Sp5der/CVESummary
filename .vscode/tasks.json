@@ -1,0 +1,15 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Run CVESummary Flask App",
+			"type": "shell",
+			"command": ".\\.venv-local\\Scripts\\python.exe",
+			"args": [
+				"app.py"
+			],
+			"isBackground": true,
+			"problemMatcher": []
+		}
+	]
+}

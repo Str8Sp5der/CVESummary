@@ -15,6 +15,7 @@ Security hardening implemented:
 import os
 import re
 import logging
+from datetime import datetime, timezone
 import bleach
 import bcrypt
 from flask import Flask, jsonify, request, render_template, abort, session, redirect, url_for
@@ -24,7 +25,12 @@ from flask_login import LoginManager, UserMixin, login_user, logout_user, login_
 from flask_wtf.csrf import CSRFProtect
 from apscheduler.schedulers.background import BackgroundScheduler
 from database import CVEDatabase
-from nvd_client import NVDClient
+from nvd_client import (
+    CVEUpstreamError,
+    CISAKEVUpdateError,
+    NVDClient,
+    NVDUpdateError,
+)
 
 # ------------------------------------------------------------------ #
 # Logging                                                              #
@@ -77,14 +83,24 @@ limiter = Limiter(
 )
 
 db  = CVEDatabase()
-nvd = NVDClient(api_key=os.environ.get("NVD_API_KEY"))
+nvd = NVDClient(
+    api_key=os.environ.get("NVD_API_KEY"),
+    github_token=os.environ.get("GITHUB_TOKEN"),
+)
 
 # ------------------------------------------------------------------ #
 # Background scheduler — update NVD every 6 hours                     #
 # ------------------------------------------------------------------ #
 scheduler = BackgroundScheduler(daemon=True)
 scheduler.add_job(
-    nvd.update_recent_cves, "interval", hours=6, args=[db], id="nvd_sync"
+    nvd.update_recent_cves, "interval", hours=6, args=[db, 7], id="nvd_sync"
+)
+scheduler.add_job(
+    nvd.sync_cisa_kev,
+    "interval",
+    hours=6,
+    args=[db],
+    id="cisa_kev_sync",
 )
 scheduler.start()
 
@@ -175,6 +191,11 @@ def not_found(e):
 @app.errorhandler(429)
 def rate_limited(e):
     return jsonify({"error": "Rate limit exceeded. Please slow down."}), 429
+
+
+@app.errorhandler(503)
+def upstream_unavailable(e):
+    return jsonify({"error": str(e.description)}), 503
 
 
 @app.errorhandler(500)
@@ -283,34 +304,95 @@ def index():
 def get_cve(raw_id: str):
     """
     Fetch full CVE detail.
-    Checks local DB first; falls through to NVD on cache miss.
+    Uses cached data unless core metadata is missing or needs a range-parser refresh.
     """
     cve_id = _validate_cve_id(raw_id)
 
     # Cache hit
     cached = db.get_cve(cve_id)
-    if cached:
+    if cached and not nvd.cache_needs_refresh(cached):
         cached["cache"] = "HIT"
         return jsonify(cached)
 
-    # Cache miss → live NVD fetch
-    fresh = nvd.fetch_cve(cve_id)
+    # Refresh old records that never had a score or affected-product data.
+    try:
+        fresh = nvd.fetch_cve(cve_id)
+    except CVEUpstreamError as exc:
+        if cached:
+            cached["cache"] = "STALE"
+            cached["data_warning"] = str(exc)
+            cached["source_warnings"] = [
+                f"{source} could not be reached; its metadata may be missing."
+                for source in exc.sources
+            ]
+            cached["sources_checked"] = list(
+                dict.fromkeys((cached.get("sources_checked") or []) + exc.sources)
+            )
+            checked_details = [
+                detail
+                for detail in cached.get("source_details", [])
+                if detail.get("source") not in exc.sources
+            ]
+            checked_details.extend(
+                {
+                    "source": source,
+                    "trust_level": "unknown",
+                    "untrusted": False,
+                    "status": "unavailable",
+                }
+                for source in exc.sources
+            )
+            cached["source_details"] = checked_details
+            cached["fetched_at"] = datetime.now(timezone.utc).isoformat()
+            db.store_cve(cached)
+            return jsonify(cached)
+        abort(503, description=str(exc))
     if not fresh:
-        abort(404, description=f"CVE '{cve_id}' not found in NVD or local database.")
+        if cached:
+            cached["cache"] = "STALE"
+            cached["data_warning"] = (
+                "The upstream sources returned no matching record; showing saved data."
+            )
+            cached["source_warnings"] = [cached["data_warning"]]
+            cached["sources_checked"] = list(
+                dict.fromkeys(
+                    (cached.get("sources_checked") or [])
+                    + ["NVD", "MITRE", "OSV", "GitHub Advisory"]
+                )
+            )
+            cached["fetched_at"] = datetime.now(timezone.utc).isoformat()
+            db.store_cve(cached)
+            return jsonify(cached)
+        abort(
+            404,
+            description=(
+                f"CVE '{cve_id}' not found in NVD, MITRE, OSV, GitHub Advisory, "
+                "Red Hat Security Data, CISA KEV, or local database."
+            ),
+        )
 
     db.store_cve(fresh)
-    fresh["cache"] = "MISS"
+    fresh["cache"] = "REFRESHED" if cached else "MISS"
     return jsonify(fresh)
 
 
 @app.route("/api/cve/<path:raw_id>/refresh")
 @limiter.limit("5 per minute; 20 per hour")
 def refresh_cve(raw_id: str):
-    """Force a live re-fetch from NVD and update the local cache."""
+    """Force a live re-fetch from all CVE sources, then update the local cache."""
     cve_id = _validate_cve_id(raw_id)
-    fresh = nvd.fetch_cve(cve_id)
+    try:
+        fresh = nvd.fetch_cve(cve_id)
+    except CVEUpstreamError as exc:
+        abort(503, description=str(exc))
     if not fresh:
-        abort(404, description=f"CVE '{cve_id}' not found in NVD.")
+        abort(
+            404,
+            description=(
+                f"CVE '{cve_id}' not found in NVD, MITRE, OSV, GitHub Advisory, "
+                "Red Hat Security Data, or CISA KEV."
+            ),
+        )
     db.store_cve(fresh)
     fresh["cache"] = "REFRESHED"
     return jsonify(fresh)
@@ -328,6 +410,48 @@ def search():
     limit = max(1, min(limit, 50))
     results = db.search_cves(query, limit=limit)
     return jsonify({"query": query, "count": len(results), "results": results})
+
+
+@app.route("/api/search/live")
+@limiter.limit("2 per minute")
+def search_live():
+    """Search the local cache plus NVD, when explicitly requested by the user."""
+    query = _validate_search_query(request.args.get("q", ""))
+    try:
+        limit = int(request.args.get("limit", 8))
+    except ValueError:
+        abort(400, description="Limit must be an integer.")
+    limit = max(1, min(limit, 50))
+    local_results = db.search_cves(query, limit=limit)
+
+    try:
+        nvd_results, total_results = nvd.search_cves(query, limit=limit)
+    except CVEUpstreamError as exc:
+        if not local_results:
+            abort(503, description=str(exc))
+        return jsonify(
+            {
+                "query": query,
+                "count": len(local_results),
+                "results": local_results,
+                "warning": str(exc),
+                "total_upstream": None,
+            }
+        )
+
+    nvd_ids = {record["id"] for record in nvd_results}
+    results = nvd_results + [
+        item for item in local_results if item["id"] not in nvd_ids
+    ]
+    results = results[:limit]
+    return jsonify(
+        {
+            "query": query,
+            "count": len(results),
+            "results": results,
+            "total_upstream": total_results,
+        }
+    )
 
 
 @app.route("/api/recent")
@@ -353,9 +477,39 @@ def stats():
 @app.route("/api/trigger-update")
 @limiter.limit("2 per hour")
 def trigger_update():
-    """Manually trigger an NVD sync (rate-limited)."""
-    count = nvd.update_recent_cves(db, days_back=1)
-    return jsonify({"message": f"Update complete. {count} CVEs processed."})
+    """Manually trigger NVD and CISA KEV synchronization (rate-limited)."""
+    nvd_count = None
+    kev_count = None
+    failures = []
+    try:
+        nvd_count = nvd.update_recent_cves(db, days_back=1)
+    except NVDUpdateError as exc:
+        log.error("Manual NVD sync failed: %s", exc)
+        failures.append({"source": "NVD", "error": str(exc)})
+    try:
+        kev_count = nvd.sync_cisa_kev(db)
+    except CISAKEVUpdateError as exc:
+        log.error("Manual CISA KEV sync failed: %s", exc)
+        failures.append({"source": "CISA KEV", "error": str(exc)})
+    if failures:
+        return jsonify(
+            {
+                "error": "One or more vulnerability data synchronizations failed.",
+                "failed_sources": failures,
+                "nvd_updated": nvd_count,
+                "cisa_kev_updated": kev_count,
+            }
+        ), 502
+    return jsonify(
+        {
+            "message": (
+                f"Update complete. NVD processed {nvd_count} CVEs; "
+                f"CISA KEV processed {kev_count} CVEs."
+            ),
+            "nvd_updated": nvd_count,
+            "cisa_kev_updated": kev_count,
+        }
+    )
 
 
 @app.route("/api/cve/<path:raw_id>/poc")

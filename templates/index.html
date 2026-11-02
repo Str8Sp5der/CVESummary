@@ -465,6 +465,20 @@ main {
   letter-spacing: 0.08em;
   margin-bottom: 3px;
 }
+.trust-badge {
+  display: inline-block;
+  margin-left: 5px;
+  padding: 1px 5px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--text-muted);
+  font: 600 0.58rem var(--font-mono);
+  letter-spacing: 0.04em;
+  vertical-align: middle;
+}
+.trust-badge.authoritative { color: var(--low); border-color: rgba(0,230,118,0.3); }
+.trust-badge.secondary, .trust-badge.curated { color: var(--cyan); border-color: rgba(0,212,255,0.3); }
+.trust-badge.untrusted { color: var(--critical); border-color: rgba(255,59,92,0.45); background: var(--critical-bg); }
 .cvss-metric-value {
   font-family: var(--font-mono);
   font-size: 0.78rem;
@@ -912,7 +926,7 @@ main {
       <svg class="search-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
         <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
       </svg>
-      <input id="mainSearch" type="text" placeholder="CVE-2021-44228  or  search description..." autocomplete="off" spellcheck="false" maxlength="120">
+      <input id="mainSearch" type="text" placeholder="CVE ID or description (Enter searches live NVD)" autocomplete="off" spellcheck="false" maxlength="120">
       <div class="search-dropdown" id="searchDropdown"></div>
     </div>
 
@@ -923,8 +937,8 @@ main {
       <button class="btn-refresh" id="btnLogin" title="Login">🔐 Login</button>
       <button class="btn-refresh" id="btnRegister" title="Register">✔ Register</button>
       <button class="btn-refresh" id="btnLogout" title="Logout" style="display:none;">⇦ Logout</button>
-      <button class="btn-refresh" id="triggerUpdate" title="Sync latest CVEs from NVD">
-        ↻ Sync NVD
+      <button class="btn-refresh" id="triggerUpdate" title="Sync NVD updates and the CISA KEV catalog">
+        ↻ Sync Feeds
       </button>
     </div>
   </header>
@@ -1333,6 +1347,11 @@ async function renderPocContent(cveId, pocPanel) {
       const header2 = el('div', 'poc-item-header');
       const srcBadge = el('span', `poc-source-badge ${poc.source || 'Unknown'}`);
       setText(srcBadge, poc.source || '?'); header2.appendChild(srcBadge);
+      if (poc.untrusted) {
+        const trustBadge = el('span', 'trust-badge untrusted');
+        setText(trustBadge, 'UNVERIFIED CODE');
+        header2.appendChild(trustBadge);
+      }
       const title = el('div', 'poc-title'); setText(title, poc.title || 'Untitled exploit'); header2.appendChild(title);
       item.appendChild(header2);
 
@@ -1427,18 +1446,31 @@ function renderCVE(data) {
   idDisplay.appendChild(copyBtn);
   idBlock.appendChild(idDisplay);
 
-  const sev = severityClass(data.severity || (data.cvss_v3?.severity) || "UNKNOWN");
+  const primaryCvss = data.cvss_v4 || data.cvss_v3 || data.cvss_v2;
+  const sev = severityClass(data.severity || primaryCvss?.severity || "UNKNOWN");
   const badge = el("span", `sev-badge ${sev}`);
   const dot = el("span", "sev-dot"); badge.appendChild(dot);
   badge.appendChild(document.createTextNode(sev));
   idBlock.appendChild(badge);
+  if (data.cisa_kev) {
+    const kevBadge = el("span", "cwe-badge");
+    setText(kevBadge, `CISA Known Exploited${data.cisa_kev.date_added ? " · " + data.cisa_kev.date_added : ""}`);
+    idBlock.appendChild(kevBadge);
+  }
 
   const dates = el("div", "cve-dates");
   const pub = el("span"); setText(pub, "Published " + formatDate(data.published)); dates.appendChild(pub);
   const mod = el("span"); setText(mod, "Modified " + formatDate(data.modified)); dates.appendChild(mod);
+  if (data.source) {
+    const source = el("span"); setText(source, "Sources: " + data.source); dates.appendChild(source);
+  }
   if (data.cache) {
     const cache = el("span"); setText(cache, "Cache: " + data.cache);
     cache.style.color = "var(--text-muted)"; dates.appendChild(cache);
+  }
+  if (data.data_warning) {
+    const warning = el("span"); setText(warning, data.data_warning);
+    warning.style.color = "var(--high)"; dates.appendChild(warning);
   }
   idBlock.appendChild(dates);
   header.appendChild(idBlock);
@@ -1459,8 +1491,7 @@ function renderCVE(data) {
 
   // ─ CVSS Panel ─
   const cvssPanel = el("div", "cvss-panel");
-  const cvssData = data.cvss_v3 || data.cvss_v2;
-  const cvssVersion = data.cvss_v3 ? "v3" : data.cvss_v2 ? "v2" : null;
+  const cvssData = primaryCvss;
   const score = cvssData?.score ?? null;
   const severity = cvssData?.severity || "UNKNOWN";
 
@@ -1468,61 +1499,116 @@ function renderCVE(data) {
   cvssPanel.appendChild(gaugeWrap);
 
   const cvssDetails = el("div", "cvss-details");
-  if (data.cvss_v3) {
-    const v3 = data.cvss_v3;
-    const row1 = el("div", "cvss-row");
-    const metrics = [
-      ["Attack Vector",       v3.attack_vector],
-      ["Attack Complexity",   v3.attack_complexity],
-      ["Privileges Required", v3.privileges_required],
-      ["User Interaction",    v3.user_interaction],
-      ["Scope",               v3.scope],
-      ["Confidentiality",     v3.confidentiality_impact],
-      ["Integrity",           v3.integrity_impact],
-      ["Availability",        v3.availability_impact],
-    ];
-    metrics.forEach(([label, val]) => {
-      if (!val) return;
-      const m = el("div", "cvss-metric");
-      const ml = el("div", "cvss-metric-label"); setText(ml, label); m.appendChild(ml);
-      const mv = el("div", "cvss-metric-value"); setText(mv, val); m.appendChild(mv);
-      row1.appendChild(m);
-    });
-    cvssDetails.appendChild(row1);
-
-    if (v3.vector) {
-      const vecWrap = el("div", "cvss-vector");
-      const vecText = el("span"); setText(vecText, v3.vector); vecWrap.appendChild(vecText);
-      const vecCopy = el("button", "copy-btn"); setText(vecCopy, "COPY");
-      vecCopy.addEventListener("click", () => {
-        navigator.clipboard.writeText(v3.vector).then(() => { setText(vecCopy, "✓"); setTimeout(() => setText(vecCopy, "COPY"), 1500); });
-      });
-      vecWrap.appendChild(vecCopy);
-      cvssDetails.appendChild(vecWrap);
+  const cvssVersions = [
+    ["CVSS v4.0", data.cvss_v4],
+    ["CVSS v3", data.cvss_v3],
+    ["CVSS v2", data.cvss_v2],
+  ].filter(([, value]) => value);
+  cvssVersions.forEach(([version, cvss]) => {
+    const versionLabel = el("div", "cvss-metric-label");
+    setText(versionLabel, `${version}: ${cvss.score ?? "N/A"} (${cvss.severity || "UNKNOWN"})`);
+    cvssDetails.appendChild(versionLabel);
+    if (cvss.source) {
+      const sourceLabel = el("span", "trust-badge");
+      setText(sourceLabel, cvss.source);
+      versionLabel.appendChild(sourceLabel);
     }
-  } else if (!cvssData) {
+    if (cvss.untrusted) {
+      const trustBadge = el("span", "trust-badge untrusted");
+      setText(trustBadge, "UNVERIFIED SOURCE");
+      versionLabel.appendChild(trustBadge);
+    }
+
+    const metrics = [
+      ["Attack Vector", cvss.attack_vector],
+      ["Attack Complexity", cvss.attack_complexity],
+      ["Privileges Required", cvss.privileges_required],
+      ["User Interaction", cvss.user_interaction],
+      ["Scope", cvss.scope],
+      ["Confidentiality", cvss.confidentiality_impact],
+      ["Integrity", cvss.integrity_impact],
+      ["Availability", cvss.availability_impact],
+    ].filter(([, value]) => value);
+    if (metrics.length) {
+      const row = el("div", "cvss-row");
+      metrics.forEach(([label, value]) => {
+        const metric = el("div", "cvss-metric");
+        const metricLabel = el("div", "cvss-metric-label"); setText(metricLabel, label); metric.appendChild(metricLabel);
+        const metricValue = el("div", "cvss-metric-value"); setText(metricValue, value); metric.appendChild(metricValue);
+        row.appendChild(metric);
+      });
+      cvssDetails.appendChild(row);
+    }
+
+    if (cvss.vector) {
+      const vectorWrap = el("div", "cvss-vector");
+      const vectorText = el("span"); setText(vectorText, cvss.vector); vectorWrap.appendChild(vectorText);
+      const vectorCopy = el("button", "copy-btn"); setText(vectorCopy, "COPY");
+      vectorCopy.addEventListener("click", () => {
+        navigator.clipboard.writeText(cvss.vector).then(() => { setText(vectorCopy, "✓"); setTimeout(() => setText(vectorCopy, "COPY"), 1500); });
+      });
+      vectorWrap.appendChild(vectorCopy);
+      cvssDetails.appendChild(vectorWrap);
+    }
+  });
+  if (!cvssData) {
     const noCvss = el("div", "cvss-metric");
     const nol = el("div", "cvss-metric-label"); setText(nol, "CVSS Data"); noCvss.appendChild(nol);
     const nov = el("div", "cvss-metric-value"); setText(nov, "Not available for this CVE"); noCvss.appendChild(nov);
     cvssDetails.appendChild(noCvss);
   }
 
-  if (data.cvss_v2 && data.cvss_v3) {
-    const v2row = el("div", "cvss-metric");
-    const v2l = el("div", "cvss-metric-label"); setText(v2l, "CVSSv2 Score"); v2row.appendChild(v2l);
-    const v2v = el("div", "cvss-metric-value");
-    setText(v2v, `${data.cvss_v2.score} (${data.cvss_v2.severity})`); v2row.appendChild(v2v);
-    const v2wrap = el("div", "cvss-row"); v2wrap.appendChild(v2row); cvssDetails.appendChild(v2wrap);
+  const scoreClaims = [];
+  const seenScoreClaims = new Set();
+  (data.source_observations || []).forEach(observation => {
+    Object.entries(observation.claims?.cvss || {}).forEach(([version, claim]) => {
+      const source = claim.source || observation.source;
+      const key = `${version}|${claim.score}|${source}|${observation.source_record_id}`;
+      if (!seenScoreClaims.has(key)) {
+        seenScoreClaims.add(key);
+        scoreClaims.push({ version, claim, source, observation });
+      }
+    });
+  });
+  if (scoreClaims.length) {
+    const claimsCard = el("div", "card");
+    const claimsLabel = el("div", "card-label");
+    setText(claimsLabel, "Provider CVSS Assessments");
+    claimsCard.appendChild(claimsLabel);
+    scoreClaims.forEach(({ version, claim, source, observation }) => {
+      const line = el("p", "cve-description");
+      const current = data[version];
+      const conflicts = current && Number(current.score) !== Number(claim.score);
+      setText(
+        line,
+        `${version.replace("cvss_", "CVSS ")}: ${claim.score} (${claim.severity || "UNKNOWN"}) · ${source} · ${observation.source_record_id}`
+      );
+      if (conflicts) {
+        const conflictBadge = el("span", "trust-badge untrusted");
+        setText(conflictBadge, "SCORE DIFFERS");
+        line.appendChild(conflictBadge);
+      }
+      if (claim.untrusted || claim.trust_level === "unverified") {
+        const trustBadge = el("span", "trust-badge untrusted");
+        setText(trustBadge, "UNVERIFIED");
+        line.appendChild(trustBadge);
+      }
+      claimsCard.appendChild(line);
+    });
+    cvssDetails.appendChild(claimsCard);
   }
 
   cvssPanel.appendChild(cvssDetails);
   frag.appendChild(cvssPanel);
 
+  const systems = data.affected_systems || [];
+  const affectedCount = systems.filter(sys => sys.status === "affected").length;
+
   // ─ Tabs ─
   const tabsBar = el("div", "tabs-bar");
   const tabData = [
     { key: "overview",  label: "Overview",         count: null },
-    { key: "affected",  label: "Affected Systems",  count: (data.affected_systems || []).length },
+    { key: "affected",  label: "Affected Systems",  count: affectedCount },
     { key: "poc",       label: "PoC / Exploits",    count: (data.poc || []).length },
     { key: "refs",      label: "References",         count: (data.refs || []).length },
   ];
@@ -1550,6 +1636,89 @@ function renderCVE(data) {
   overviewPanel.id = "tab-overview";
   panels.overview = overviewPanel;
 
+  const sourceWarnings = [
+    ...(data.source_warnings || []),
+    ...(data.data_warning ? [data.data_warning] : []),
+  ];
+  if (sourceWarnings.length) {
+    const warningCard = el("div", "card");
+    const warningLabel = el("div", "card-label");
+    setText(warningLabel, "Source Coverage Warning");
+    warningCard.appendChild(warningLabel);
+    sourceWarnings.forEach(warning => {
+      const message = el("p", "cve-description");
+      setText(message, warning);
+      warningCard.appendChild(message);
+    });
+    overviewPanel.appendChild(warningCard);
+  }
+
+  if (data.source_details?.length) {
+    const sourceCard = el("div", "card");
+    const sourceLabel = el("div", "card-label");
+    setText(sourceLabel, "Source Trust");
+    sourceCard.appendChild(sourceLabel);
+    data.source_details.forEach(detail => {
+      const line = el("p", "cve-description");
+      const sourceName = detail.source || "Unknown source";
+      const status = detail.status === "unavailable"
+        ? "unavailable"
+        : detail.status === "no_matching_record"
+          ? "no matching record"
+          : detail.record_type || detail.trust_level || "checked";
+      setText(line, `${sourceName}: ${status}`);
+      if (detail.source_updated_at) {
+        line.appendChild(
+          document.createTextNode(` · source updated ${formatDate(detail.source_updated_at)}`)
+        );
+      }
+      if (detail.last_checked_at) {
+        line.appendChild(
+          document.createTextNode(` · checked ${formatDate(detail.last_checked_at)}`)
+        );
+      }
+      if (detail.untrusted) {
+        const badge = el("span", "trust-badge untrusted");
+        setText(badge, "UNTRUSTED");
+        line.appendChild(badge);
+      } else if (detail.trust_level && detail.trust_level !== "unknown") {
+        const badge = el("span", `trust-badge ${detail.trust_level}`);
+        setText(badge, detail.trust_level.toUpperCase());
+        line.appendChild(badge);
+      }
+      if (detail.advisory_id) {
+        line.appendChild(document.createTextNode(` · ${detail.advisory_id}`));
+      }
+      sourceCard.appendChild(line);
+    });
+    overviewPanel.appendChild(sourceCard);
+  }
+
+  if (data.source_observations?.length) {
+    const historyCard = el("div", "card");
+    const historyLabel = el("div", "card-label");
+    setText(historyLabel, "Source Record History");
+    historyCard.appendChild(historyLabel);
+    data.source_observations.forEach(observation => {
+      const line = el("p", "cve-description");
+      const review = observation.review_status
+        ? ` · status ${observation.review_status}`
+        : "";
+      const updated = observation.source_updated_at
+        ? ` · source updated ${formatDate(observation.source_updated_at)}`
+        : "";
+      const snapshots = observation.snapshot_count > 1
+        ? ` · ${observation.snapshot_count} changed snapshots retained`
+        : "";
+      setText(
+        line,
+        `${observation.source} (${observation.source_record_id})${review}${updated} · retrieved ${formatDate(observation.retrieved_at)}${snapshots}`
+      );
+      historyCard.appendChild(line);
+    });
+    overviewPanel.appendChild(historyCard);
+  }
+
   const descCard = el("div", "card");
   const descLabel = el("div", "card-label"); setText(descLabel, "Vulnerability Description"); descCard.appendChild(descLabel);
   const descText = el("p", "cve-description"); setText(descText, data.description || "No description available."); descCard.appendChild(descText);
@@ -1564,19 +1733,54 @@ function renderCVE(data) {
     });
     descCard.appendChild(cweList);
   }
+  if (data.ssvc && data.ssvc.length) {
+    const assessmentLabel = el("div", "card-label");
+    setText(assessmentLabel, "CISA SSVC Assessment");
+    assessmentLabel.style.marginTop = "14px";
+    descCard.appendChild(assessmentLabel);
+    data.ssvc.forEach(assessment => {
+      (assessment.options || []).forEach(option => {
+        Object.entries(option).forEach(([label, value]) => {
+          const item = el("p", "cve-description");
+          setText(item, `${label}: ${value}`);
+          descCard.appendChild(item);
+        });
+      });
+    });
+  }
   overviewPanel.appendChild(descCard);
+  if (data.cisa_kev) {
+    const kevCard = el("div", "card");
+    const kevLabel = el("div", "card-label");
+    setText(kevLabel, "CISA Known Exploited Vulnerability");
+    kevCard.appendChild(kevLabel);
+    [
+      ["Date added", data.cisa_kev.date_added],
+      ["Due date", data.cisa_kev.due_date],
+      ["Known ransomware use", data.cisa_kev.known_ransomware_campaign_use],
+      ["Required action", data.cisa_kev.required_action],
+      ["Notes", data.cisa_kev.notes],
+    ].forEach(([label, value]) => {
+      if (!value) return;
+      const detail = el("p", "cve-description");
+      setText(detail, `${label}: ${value}`);
+      kevCard.appendChild(detail);
+    });
+    overviewPanel.appendChild(kevCard);
+  }
   frag.appendChild(overviewPanel);
 
   // ─ Affected Systems Panel ─
   const affectedPanel = el("div", "tab-panel");
   panels.affected = affectedPanel;
-  const systems = data.affected_systems || [];
   if (systems.length) {
     const card = el("div", "card");
-    const lbl = el("div", "card-label"); setText(lbl, `${systems.length} Affected Product${systems.length>1?"s":""}`); card.appendChild(lbl);
+    const lbl = el("div", "card-label");
+    setText(lbl, `${affectedCount} affected entr${affectedCount===1?"y":"ies"}; ${systems.length} total version ranges`);
+    card.appendChild(lbl);
     const table = el("table", "systems-table");
     const thead = el("thead"); const hrow = el("tr");
-    ["Vendor","Product","Version / Range"].forEach(h => { const th = el("th"); setText(th,h); hrow.appendChild(th); });
+    ["Vendor","Product","Version / Range","Status","Source"].forEach(h => { const th = el("th"); setText(th,h); hrow.appendChild(th); });
     thead.appendChild(hrow); table.appendChild(thead);
     const tbody = el("tbody");
     systems.forEach(sys => {
@@ -1584,11 +1788,20 @@ function renderCVE(data) {
       const td1 = el("td"); setText(td1, sys.vendor || "—");  row.appendChild(td1);
       const td2 = el("td"); setText(td2, sys.product || "—"); row.appendChild(td2);
       const td3 = el("td");
-      let ver = sys.version || "—";
-      if (sys.version_start || sys.version_end) {
+      let ver = sys.version_range || sys.version || "—";
+      if (!sys.version_range && (sys.version_start || sys.version_end)) {
         ver = `${sys.version_start ? "≥ "+sys.version_start : ""} ${sys.version_end ? "≤ "+sys.version_end : ""}`.trim();
       }
       setText(td3, ver); row.appendChild(td3);
+      const td4 = el("td"); setText(td4, sys.status || "affected"); row.appendChild(td4);
+      const td5 = el("td");
+      setText(td5, (sys.sources || [sys.source]).filter(Boolean).join(", ") || "—");
+      if (sys.untrusted) {
+        const badge = el("span", "trust-badge untrusted");
+        setText(badge, "UNTRUSTED");
+        td5.appendChild(badge);
+      }
+      row.appendChild(td5);
       tbody.appendChild(row);
     });
     table.appendChild(tbody);
@@ -1596,7 +1809,7 @@ function renderCVE(data) {
     affectedPanel.appendChild(card);
   } else {
     const card = el("div", "card");
-    const nop = el("p", "no-poc"); setText(nop, "No CPE configuration data available for this CVE."); card.appendChild(nop);
+    const nop = el("p", "no-poc"); setText(nop, "No affected-product or version data was supplied by the available sources."); card.appendChild(nop);
     affectedPanel.appendChild(card);
   }
   frag.appendChild(affectedPanel);
@@ -1620,7 +1833,13 @@ function renderCVE(data) {
       const url = el("a", "ref-url"); url.href = ref.url; url.target = "_blank"; url.rel = "noopener noreferrer";
       setText(url, ref.url); left.appendChild(url);
       if (ref.source) {
-        const src = el("div", "ref-source"); setText(src, ref.source); left.appendChild(src);
+        const src = el("div", "ref-source"); setText(src, ref.source);
+        if (ref.untrusted) {
+          const badge = el("span", "trust-badge untrusted");
+          setText(badge, "UNTRUSTED");
+          src.appendChild(badge);
+        }
+        left.appendChild(src);
       }
       if (ref.tags && ref.tags.length) {
         const tags = el("div", "ref-tags");
@@ -1687,7 +1906,7 @@ async function performSearch(query) {
     const results = data.results || [];
     searchDropdown.innerHTML = "";
     if (!results.length) {
-      const none = el("div", "dropdown-no-results"); setText(none, "No results found in local database"); searchDropdown.appendChild(none);
+      const none = el("div", "dropdown-no-results"); setText(none, "No local matches. Press Enter to search NVD."); searchDropdown.appendChild(none);
     } else {
       results.forEach(cve => {
         const item = el("div", "dropdown-item");
@@ -1701,6 +1920,50 @@ async function performSearch(query) {
   } catch {}
 }
 
+async function performLiveSearch(query) {
+  searchDropdown.innerHTML = "";
+  const loading = el("div", "dropdown-no-results");
+  setText(loading, "Searching NVD and local records…");
+  searchDropdown.appendChild(loading);
+  searchDropdown.classList.add("open");
+
+  try {
+    const data = await apiFetch(`/api/search/live?q=${encodeURIComponent(query)}&limit=8`);
+    searchDropdown.innerHTML = "";
+    if (data.total_upstream !== null && data.total_upstream !== undefined) {
+      const count = el("div", "dropdown-no-results");
+      setText(count, `NVD matched ${data.total_upstream.toLocaleString()} CVEs; showing the latest matches.`);
+      searchDropdown.appendChild(count);
+    }
+    (data.results || []).forEach(cve => {
+      const item = el("div", "dropdown-item");
+      const idEl = el("div", "dropdown-cve-id"); setText(idEl, cve.id); item.appendChild(idEl);
+      const desc = el("div", "dropdown-desc"); setText(desc, truncate(cve.description, 180)); item.appendChild(desc);
+      item.addEventListener("click", () => {
+        mainSearch.value = cve.id;
+        loadCVE(cve.id);
+        closeDropdown();
+      });
+      searchDropdown.appendChild(item);
+    });
+    if (!data.results?.length) {
+      const none = el("div", "dropdown-no-results");
+      setText(none, "No matches found in NVD or the local database.");
+      searchDropdown.appendChild(none);
+    }
+    if (data.warning) {
+      const warning = el("div", "dropdown-no-results");
+      setText(warning, data.warning);
+      searchDropdown.appendChild(warning);
+    }
+  } catch (error) {
+    searchDropdown.innerHTML = "";
+    const message = el("div", "dropdown-no-results");
+    setText(message, error.message);
+    searchDropdown.appendChild(message);
+  }
+}
+
 function closeDropdown() { searchDropdown.classList.remove("open"); }
 
 mainSearch.addEventListener("input", e => handleSearchInput(e.target.value));
@@ -1708,6 +1971,7 @@ mainSearch.addEventListener("keydown", e => {
   if (e.key === "Enter") {
     const v = mainSearch.value.trim().toUpperCase();
     if (CVE_RE.test(v)) { loadCVE(v); closeDropdown(); }
+    else if (v.length >= 2) performLiveSearch(v);
   }
   if (e.key === "Escape") closeDropdown();
 });
@@ -1724,10 +1988,10 @@ triggerUpdate.addEventListener("click", async () => {
     await loadRecent();
     await loadStats();
     triggerUpdate.textContent = "✓ Synced";
-    setTimeout(() => { triggerUpdate.textContent = "↻ Sync NVD"; }, 2500);
+    setTimeout(() => { triggerUpdate.textContent = "↻ Sync Feeds"; }, 2500);
   } catch (e) {
     triggerUpdate.textContent = "⚠ Failed";
-    setTimeout(() => { triggerUpdate.textContent = "↻ Sync NVD"; }, 2500);
+    setTimeout(() => { triggerUpdate.textContent = "↻ Sync Feeds"; }, 2500);
   } finally {
     triggerUpdate.classList.remove("spinning");
     triggerUpdate.disabled = false;

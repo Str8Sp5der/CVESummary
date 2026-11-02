@@ -2,7 +2,7 @@
 
 **Developer/s:** Zayd Yaeesh
 
-**Vibe Check:** An app that webscrapes hundreds of sources for info on given CVEs and gives PoC code to registered users.
+**Vibe Check:** An app that combines CVE metadata from NVD and the MITRE CVE Program, including CISA assessments when supplied, and retrieves PoC references for registered users.
 
 ---
 
@@ -21,7 +21,7 @@ AI is great at "vibing," but it's notorious for suggesting deprecated or insecur
 
 **AI Tool Used:** Claude, GitHub Copilot (Claude Haiku, Raptor Mini, etc.)
 
-**The "Veto":** Claude had a requirements.txt file outlining the various dependencies needed by python for the app. These dependencies were given fixed versions that are secure now. I told it to ensure these dependencies are always at their latest versions when the app is built. It did this using pip-tools which generates a new requirements.txt with the latest versions each time the app is built.
+**The "Veto":** The app's runtime dependencies are listed in `requirements.txt`. Dependency versions use minimum compatible versions and can be upgraded with `pip install --upgrade -r requirements.txt`.
 
 ---
 
@@ -45,11 +45,9 @@ List any third-party libraries or frameworks used.
 - flask-login
 - flask-wtf
 - requests
-- beautifulsoup4
 - bleach
 - bcrypt
 - apscheduler
-- pip-tools
 
 **Verification:** Did you check for known vulnerabilities in these packages (e.g., using npm audit or Snyk)?
 
