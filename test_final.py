@@ -1,39 +1,24 @@
-#!/usr/bin/env python3
-"""Quick focused test with proper spacing - avoids rate limit"""
-import requests
-import time
+from conftest import authenticate, csrf_token
 
-BASE_URL = 'http://127.0.0.1:5000'
 
-# Register
-print('Registering user...')
-r = requests.post(f'{BASE_URL}/api/register', json={'username': 'finaltest', 'password': 'FinalPass123!'})
-print(f'  Result: {r.status_code} {r.json().get("message", "OK")}')
-time.sleep(2)
+def test_poc_route_requires_authentication_and_uses_cached_data(application):
+    client = application.app.test_client()
+    token = csrf_token(client)
+    application.db.store_cve(
+        {
+            "id": "CVE-2021-44228",
+            "poc": [{"title": "Cached reference", "url": "https://example.test/poc"}],
+        }
+    )
 
-# Login
-print('Logging in...')
-s = requests.Session()
-r = s.post(f'{BASE_URL}/api/login', json={'username': 'finaltest', 'password': 'FinalPass123!'})
-print(f'  Result: {r.status_code}')
-print(f'  Authenticated: {r.status_code == 200}')
-time.sleep(1)
+    anonymous = client.get("/api/cve/CVE-2021-44228/poc")
+    assert anonymous.status_code == 401
 
-# Access protected endpoint
-print('Accessing protected PoC endpoint...')
-r = s.get(f'{BASE_URL}/api/cve/CVE-2021-44228/poc')
-print(f'  Result: {r.status_code}')
-print(f'  Got PoCs: {len(r.json().get("poc", [])) if r.status_code == 200 else 0}')
-time.sleep(1)
+    authenticate(application, client, "poc-user")
+    response = client.get("/api/cve/CVE-2021-44228/poc")
+    assert response.status_code == 200
+    assert response.get_json()["accessed_by"] == "poc-user"
+    assert response.get_json()["poc"][0]["title"] == "Cached reference"
 
-# Logout
-print('Logging out...')
-r = s.post(f'{BASE_URL}/api/logout')
-print(f'  Result: {r.status_code}')
-time.sleep(1)
-
-# Try to access after logout
-print('Trying PoC endpoint after logout...')
-r = s.get(f'{BASE_URL}/api/cve/CVE-2021-44228/poc')
-print(f'  Result: {r.status_code} (should be 401)')
-print(f'  ✓ Session properly cleared' if r.status_code == 401 else '  ✗ Session not cleared')
+    assert client.post("/api/logout", headers={"X-CSRFToken": token}).status_code == 200
+    assert client.get("/api/cve/CVE-2021-44228/poc").status_code == 401

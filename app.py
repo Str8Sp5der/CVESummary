@@ -27,9 +27,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from database import CVEDatabase
 from nvd_client import (
     CVEUpstreamError,
-    CISAKEVUpdateError,
     NVDClient,
-    NVDUpdateError,
 )
 
 # ------------------------------------------------------------------ #
@@ -152,6 +150,26 @@ def _validate_search_query(raw: str) -> str:
     return bleach.clean(raw.strip(), tags=[], attributes={}, strip=True)
 
 
+def _provider_status_observations(
+    outcomes: dict[str, str], attempted_at: dict[str, str]
+) -> list[dict]:
+    return [
+        {
+            "source": source,
+            "record_id": "retrieval-status",
+            "retrieved_at": attempted_at[source],
+            "trust_level": "unknown",
+            "review_status": status,
+            "claims": {"retrieval_status": status},
+            "payload": {
+                "retrieval_status": status,
+                "retrieved_at": attempted_at[source],
+            },
+        }
+        for source, status in sorted(outcomes.items())
+    ]
+
+
 # ------------------------------------------------------------------ #
 # Security response headers (Hardening Measure #2)                    #
 # ------------------------------------------------------------------ #
@@ -209,7 +227,6 @@ def server_error(e):
 # ------------------------------------------------------------------ #
 @app.route("/api/register", methods=["POST"])
 @limiter.limit("5 per hour")
-@csrf.exempt
 def register():
     """User registration endpoint."""
     data = request.get_json() or {}
@@ -232,7 +249,6 @@ def register():
 
 @app.route("/api/login", methods=["POST"])
 @limiter.limit("10 per hour")  # Stricter limit for login
-@csrf.exempt
 def login():
     """User login endpoint with brute-force protection."""
     data = request.get_json() or {}
@@ -274,7 +290,6 @@ def login():
 
 @app.route("/api/logout", methods=["POST"])
 @login_required
-@csrf.exempt
 def logout():
     """User logout endpoint."""
     username = current_user.username
@@ -299,70 +314,148 @@ def index():
     return render_template("index.html")
 
 
-@app.route("/api/cve/<path:raw_id>")
+@app.route("/api/cve/<path:raw_id>", methods=["GET", "POST"])
 @limiter.limit("40 per minute; 200 per hour")
 def get_cve(raw_id: str):
     """
-    Fetch full CVE detail.
-    Uses cached data unless core metadata is missing or needs a range-parser refresh.
+    Read cached CVE data or explicitly fetch it with POST.
     """
     cve_id = _validate_cve_id(raw_id)
 
-    # Cache hit
     cached = db.get_cve(cve_id)
     if cached and not nvd.cache_needs_refresh(cached):
         cached["cache"] = "HIT"
         return jsonify(cached)
-
-    # Refresh old records that never had a score or affected-product data.
-    try:
-        fresh = nvd.fetch_cve(cve_id)
-    except CVEUpstreamError as exc:
-        if cached:
-            cached["cache"] = "STALE"
-            cached["data_warning"] = str(exc)
-            cached["source_warnings"] = [
-                f"{source} could not be reached; its metadata may be missing."
-                for source in exc.sources
-            ]
-            cached["sources_checked"] = list(
-                dict.fromkeys((cached.get("sources_checked") or []) + exc.sources)
-            )
-            checked_details = [
-                detail
-                for detail in cached.get("source_details", [])
-                if detail.get("source") not in exc.sources
-            ]
-            checked_details.extend(
-                {
-                    "source": source,
-                    "trust_level": "unknown",
-                    "untrusted": False,
-                    "status": "unavailable",
-                }
-                for source in exc.sources
-            )
-            cached["source_details"] = checked_details
-            cached["fetched_at"] = datetime.now(timezone.utc).isoformat()
-            db.store_cve(cached)
-            return jsonify(cached)
-        abort(503, description=str(exc))
-    if not fresh:
+    if request.method == "GET":
         if cached:
             cached["cache"] = "STALE"
             cached["data_warning"] = (
+                "Cached data may be outdated. Submit a POST request to refresh it."
+            )
+            return jsonify(cached)
+        abort(
+            404,
+            description=(
+                f"CVE '{cve_id}' is not in the local cache. "
+                "Submit a POST request to fetch it."
+            ),
+        )
+
+    try:
+        fresh = nvd.fetch_cve(cve_id)
+    except CVEUpstreamError as exc:
+        outcomes = exc.outcomes or {
+            source: "unavailable" for source in exc.sources
+        }
+        attempted_at = {
+            source: (exc.attempted_at or {}).get(
+                source, datetime.now(timezone.utc).isoformat()
+            )
+            for source in outcomes
+        }
+        if cached:
+            warnings = [
+                (
+                    f"{source} returned incomplete data; previous metadata was retained."
+                    if status == "partial"
+                    else f"{source} could not be reached; its metadata may be missing."
+                )
+                for source, status in outcomes.items()
+                if status in {"unavailable", "partial"}
+            ]
+            update = {
+                "id": cve_id,
+                "source": "",
+                "provider_updates": list(outcomes),
+                "sources_checked": list(outcomes),
+                "source_details": [
+                    {
+                        "source": source,
+                        "status": status,
+                        "last_checked_at": attempted_at[source],
+                    }
+                    for source, status in sorted(outcomes.items())
+                ],
+                "source_warnings": warnings,
+                "source_records": _provider_status_observations(outcomes, attempted_at),
+                "fetched_at": max(
+                    attempted_at.values(), default=datetime.now(timezone.utc).isoformat()
+                ),
+            }
+            db.store_cve(update)
+            stale = db.get_cve(cve_id)
+            stale["cache"] = "STALE"
+            stale["data_warning"] = str(exc)
+            return jsonify(stale)
+        warnings = [
+            (
+                f"{source} returned incomplete data."
+                if status == "partial"
+                else f"{source} could not be reached."
+            )
+            for source, status in outcomes.items()
+            if status in {"unavailable", "partial"}
+        ]
+        return (
+            jsonify(
+                {
+                    "error": str(exc),
+                    "cache": "MISS",
+                    "provider_outcomes": outcomes,
+                    "source_details": [
+                        {
+                            "source": source,
+                            "status": status,
+                            "last_checked_at": attempted_at[source],
+                        }
+                        for source, status in sorted(outcomes.items())
+                    ],
+                    "source_warnings": warnings,
+                    "source_records": _provider_status_observations(
+                        outcomes, attempted_at
+                    ),
+                }
+            ),
+            503,
+        )
+    if not fresh:
+        if cached:
+            checked_sources = [
+                "NVD",
+                "MITRE",
+                "OSV",
+                "GitHub Advisory",
+                "Red Hat Security Data",
+                "CISA KEV",
+            ]
+            checked_at = datetime.now(timezone.utc).isoformat()
+            outcomes = {source: "no_matching_record" for source in checked_sources}
+            attempted_at = {source: checked_at for source in checked_sources}
+            update = {
+                "id": cve_id,
+                "source": "",
+                "provider_updates": checked_sources,
+                "sources_checked": checked_sources,
+                "source_details": [
+                    {
+                        "source": source,
+                        "status": "no_matching_record",
+                        "last_checked_at": checked_at,
+                    }
+                    for source in checked_sources
+                ],
+                "source_warnings": [],
+                "source_records": _provider_status_observations(outcomes, attempted_at),
+                "cisa_kev": None,
+                "fetched_at": checked_at,
+            }
+            db.store_cve(update)
+            stale = db.get_cve(cve_id)
+            stale["cache"] = "STALE"
+            stale["data_warning"] = (
                 "The upstream sources returned no matching record; showing saved data."
             )
-            cached["source_warnings"] = [cached["data_warning"]]
-            cached["sources_checked"] = list(
-                dict.fromkeys(
-                    (cached.get("sources_checked") or [])
-                    + ["NVD", "MITRE", "OSV", "GitHub Advisory"]
-                )
-            )
-            cached["fetched_at"] = datetime.now(timezone.utc).isoformat()
-            db.store_cve(cached)
-            return jsonify(cached)
+            return jsonify(stale)
         abort(
             404,
             description=(
@@ -372,12 +465,14 @@ def get_cve(raw_id: str):
         )
 
     db.store_cve(fresh)
-    fresh["cache"] = "REFRESHED" if cached else "MISS"
-    return jsonify(fresh)
+    result = db.get_cve(cve_id)
+    result["cache"] = "REFRESHED" if cached else "MISS"
+    return jsonify(result)
 
 
-@app.route("/api/cve/<path:raw_id>/refresh")
+@app.route("/api/cve/<path:raw_id>/refresh", methods=["POST"])
 @limiter.limit("5 per minute; 20 per hour")
+@login_required
 def refresh_cve(raw_id: str):
     """Force a live re-fetch from all CVE sources, then update the local cache."""
     cve_id = _validate_cve_id(raw_id)
@@ -394,8 +489,15 @@ def refresh_cve(raw_id: str):
             ),
         )
     db.store_cve(fresh)
-    fresh["cache"] = "REFRESHED"
-    return jsonify(fresh)
+    result = db.get_cve(cve_id)
+    result["cache"] = "REFRESHED"
+    return jsonify(result)
+
+
+@app.route("/api/cve/<path:raw_id>/refresh", methods=["GET"])
+def reject_get_refresh(raw_id: str):
+    """Prevent the general CVE path route from interpreting refresh as an ID."""
+    return jsonify({"error": "Use POST to refresh a CVE."}), 405
 
 
 @app.route("/api/search")
@@ -474,42 +576,14 @@ def stats():
     return jsonify(db.get_stats())
 
 
-@app.route("/api/trigger-update")
+@app.route("/api/trigger-update", methods=["POST"])
 @limiter.limit("2 per hour")
+@login_required
 def trigger_update():
-    """Manually trigger NVD and CISA KEV synchronization (rate-limited)."""
-    nvd_count = None
-    kev_count = None
-    failures = []
-    try:
-        nvd_count = nvd.update_recent_cves(db, days_back=1)
-    except NVDUpdateError as exc:
-        log.error("Manual NVD sync failed: %s", exc)
-        failures.append({"source": "NVD", "error": str(exc)})
-    try:
-        kev_count = nvd.sync_cisa_kev(db)
-    except CISAKEVUpdateError as exc:
-        log.error("Manual CISA KEV sync failed: %s", exc)
-        failures.append({"source": "CISA KEV", "error": str(exc)})
-    if failures:
-        return jsonify(
-            {
-                "error": "One or more vulnerability data synchronizations failed.",
-                "failed_sources": failures,
-                "nvd_updated": nvd_count,
-                "cisa_kev_updated": kev_count,
-            }
-        ), 502
+    """Manual feed sync is disabled until administrator authorization exists."""
     return jsonify(
-        {
-            "message": (
-                f"Update complete. NVD processed {nvd_count} CVEs; "
-                f"CISA KEV processed {kev_count} CVEs."
-            ),
-            "nvd_updated": nvd_count,
-            "cisa_kev_updated": kev_count,
-        }
-    )
+        {"error": "Manual feed synchronization requires administrator authorization."}
+    ), 403
 
 
 @app.route("/api/cve/<path:raw_id>/poc")
@@ -532,7 +606,10 @@ def get_cve_poc(raw_id: str):
         })
 
     # Try to fetch from MITRE and extract PoC
-    fresh = nvd.fetch_cve(cve_id)
+    try:
+        fresh = nvd.fetch_cve(cve_id)
+    except CVEUpstreamError as exc:
+        abort(503, description=str(exc))
     if not fresh:
         abort(404, description=f"CVE '{cve_id}' not found.")
 

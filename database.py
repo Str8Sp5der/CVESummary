@@ -14,6 +14,22 @@ from typing import Iterator
 
 DB_PATH = Path("data/cve_database.db")
 log = logging.getLogger(__name__)
+_PROVIDER_NAMES = (
+    "NVD",
+    "MITRE",
+    "OSV",
+    "GitHub Advisory",
+    "Red Hat Security Data",
+    "CISA KEV",
+)
+_PROVIDER_STATUSES = {
+    "successful",
+    "no_matching_record",
+    "unavailable",
+    "partial",
+    "not_attempted",
+    "unknown",
+}
 
 
 class CVEDatabase:
@@ -198,47 +214,152 @@ class CVEDatabase:
         with self._connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             existing = conn.execute(
-                "SELECT affected_systems, refs, cwes, cisa_kev, source "
+                "SELECT affected_systems, refs, cwes, cisa_kev, source, "
+                "sources_checked, source_details, source_warnings "
                 "FROM cves WHERE id = ?",
                 (data["id"],),
             ).fetchone()
             old_affected = json.loads(existing["affected_systems"] or "[]") if existing else []
             old_refs = json.loads(existing["refs"] or "[]") if existing else []
             old_cwes = json.loads(existing["cwes"] or "[]") if existing else []
-            checked_sources = data.get("sources_checked") or data.get(
-                "source", ""
-            ).split(" + ")
-            unavailable_sources = {
-                detail.get("source")
-                for detail in data.get("source_details", [])
-                if isinstance(detail, dict)
-                and detail.get("status") == "unavailable"
+            old_sources_checked = json.loads(existing["sources_checked"] or "[]") if existing else []
+            old_source_details = json.loads(existing["source_details"] or "[]") if existing else []
+            old_source_warnings = json.loads(existing["source_warnings"] or "[]") if existing else []
+            raw_details = data.get("source_details")
+            incoming_details = raw_details if isinstance(raw_details, list) else []
+            raw_checked_sources = data.get("sources_checked")
+            checked_sources = (
+                raw_checked_sources
+                if isinstance(raw_checked_sources, list)
+                else str(data.get("source") or "").split(" + ")
+            )
+            raw_updates = data.get("provider_updates")
+            has_explicit_updates = isinstance(raw_updates, list)
+            if isinstance(raw_updates, list):
+                updated_sources = [
+                    self._provider_name(source)
+                    for source in raw_updates
+                    if isinstance(source, str) and source.strip()
+                ]
+            else:
+                # Legacy callers may identify the record's actual origin in source.
+                updated_sources = [
+                    self._provider_name(source)
+                    for source in str(data.get("source") or "").split(" + ")
+                    if source.strip()
+                ]
+                if not existing:
+                    updated_sources.extend(
+                        self._provider_name(source)
+                        for source in checked_sources
+                        if isinstance(source, str) and source.strip()
+                    )
+                    updated_sources.extend(
+                        self._provider_name(detail.get("source", ""))
+                        for detail in incoming_details
+                        if isinstance(detail, dict)
+                        and isinstance(detail.get("source"), str)
+                        and detail.get("source").strip()
+                    )
+            updated_sources = self._sort_provider_names(updated_sources)
+            provider_statuses = self._provider_statuses(
+                updated_sources,
+                incoming_details,
+                data.get("source_warnings"),
+                "partial" if has_explicit_updates else "unknown",
+            )
+            updated_sources = [
+                provider
+                for provider in updated_sources
+                if provider_statuses[provider] != "not_attempted"
+            ]
+            provider_statuses = {
+                provider: provider_statuses[provider] for provider in updated_sources
             }
+            for field in ("affected_systems", "refs"):
+                if field in data and (
+                    not isinstance(data[field], list)
+                    or any(not isinstance(item, dict) for item in data[field])
+                ):
+                    for provider in updated_sources:
+                        if provider_statuses[provider] == "successful":
+                            provider_statuses[provider] = "partial"
             refreshed_sources = [
                 source
-                for source in checked_sources
-                if source not in unavailable_sources
+                for source in updated_sources
+                if provider_statuses[source] in {"successful", "no_matching_record"}
             ]
+            replace_sources = [
+                source
+                for source in refreshed_sources
+                if provider_statuses[source] == "no_matching_record"
+                or (
+                    "affected_systems" in data
+                    and isinstance(data["affected_systems"], list)
+                    and all(isinstance(item, dict) for item in data["affected_systems"])
+                )
+            ]
+            replace_ref_sources = [
+                source
+                for source in refreshed_sources
+                if provider_statuses[source] == "no_matching_record"
+                or (
+                    "refs" in data
+                    and isinstance(data["refs"], list)
+                    and all(isinstance(item, dict) for item in data["refs"])
+                )
+            ]
+            checked_at = data.get("fetched_at") or datetime.now(timezone.utc).isoformat()
             affected_systems = self._merge_affected_systems(
                 old_affected,
-                data.get("affected_systems", []),
-                refreshed_sources,
+                data.get("affected_systems") if "affected_systems" in data else [],
+                replace_sources,
                 existing["source"] if existing else "",
             )
             refs = self._merge_refs(
                 old_refs,
-                data.get("refs") or [],
-                refreshed_sources,
+                data.get("refs") if "refs" in data else [],
+                replace_ref_sources,
             )
             cwes = self._merge_unique(
                 old_cwes + (data.get("cwes") or []), lambda item: item
             )
+            merged_sources_checked = self._merge_source_names(
+                old_sources_checked,
+                checked_sources,
+            )
+            incoming_warnings = data.get("source_warnings")
+            incoming_warnings = (
+                [warning for warning in incoming_warnings if isinstance(warning, str)]
+                if isinstance(incoming_warnings, list)
+                else []
+            )
+            incoming_warnings.extend(
+                f"{provider} returned incomplete data; previous data was retained."
+                for provider, status in provider_statuses.items()
+                if status == "partial"
+                and not any(
+                    warning.casefold().startswith(provider.casefold())
+                    for warning in incoming_warnings
+                )
+            )
+            merged_source_details = self._merge_provider_details(
+                old_source_details,
+                incoming_details,
+                updated_sources,
+                checked_at,
+                provider_statuses,
+            )
+            merged_source_warnings = self._merge_string_list(
+                old_source_warnings,
+                incoming_warnings,
+                provider_statuses,
+            )
             cisa_kev = data.get("cisa_kev")
             if (
-                cisa_kev is None
-                and "CISA KEV" not in refreshed_sources
-                and existing
-            ):
+                "CISA KEV" not in refreshed_sources
+                or ("cisa_kev" not in data and existing)
+            ) and existing:
                 cisa_kev_json = existing["cisa_kev"] or "null"
             else:
                 cisa_kev_json = json.dumps(cisa_kev)
@@ -289,7 +410,7 @@ class CVEDatabase:
                                                AND excluded.cvss_v3 = 'null'
                                                AND excluded.cvss_v2 = 'null'
                                              THEN cves.cvss_score ELSE excluded.cvss_score END,
-                    source           = excluded.source,
+                    source           = COALESCE(NULLIF(excluded.source, ''), cves.source),
                     fetched_at       = excluded.fetched_at
                 """,
                 (
@@ -305,9 +426,9 @@ class CVEDatabase:
                     json.dumps(cwes),
                     cisa_kev_json,
                     json.dumps(data.get("ssvc", [])),
-                    json.dumps(data.get("sources_checked", [])),
-                    json.dumps(data.get("source_details", [])),
-                    json.dumps(data.get("source_warnings", [])),
+                    json.dumps(merged_sources_checked),
+                    json.dumps(merged_source_details),
+                    json.dumps(merged_source_warnings),
                     json.dumps(data.get("poc", [])),
                     severity,
                     score,
@@ -337,7 +458,12 @@ class CVEDatabase:
                          payload_sha256, payload_json)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(cve_id, source, source_record_id, payload_sha256)
-                    DO UPDATE SET claims_json = excluded.claims_json
+                    DO UPDATE SET
+                        claims_json = excluded.claims_json,
+                        retrieved_at = excluded.retrieved_at,
+                        source_updated_at = excluded.source_updated_at,
+                        trust_level = excluded.trust_level,
+                        review_status = excluded.review_status
                     """,
                     (
                         data["id"],
@@ -345,8 +471,7 @@ class CVEDatabase:
                         record_id,
                         observation.get("source_updated_at") or None,
                         observation.get("retrieved_at")
-                        or data.get("fetched_at")
-                        or datetime.now(timezone.utc).isoformat(),
+                        or checked_at,
                         observation.get("trust_level") or "unknown",
                         observation.get("review_status") or None,
                         json.dumps(
@@ -371,14 +496,273 @@ class CVEDatabase:
         return merged
 
     @staticmethod
+    def _provider_name(source: str) -> str:
+        if not isinstance(source, str):
+            return ""
+        source = source.strip()
+        folded = source.casefold()
+        for provider in _PROVIDER_NAMES:
+            if folded == provider.casefold() or folded.startswith(
+                f"{provider.casefold()} ("
+            ):
+                return provider
+        if folded in {"mitre/cna", "mitre cve", "mitre adp", "cisa-adp"} or folded.endswith(
+            " adp"
+        ):
+            return "MITRE"
+        return source
+
+    @classmethod
+    def _sort_provider_names(cls, values: list) -> list:
+        merged = {
+            cls._provider_name(value)
+            for value in values or []
+            if isinstance(value, str) and value.strip()
+        }
+        provider_order = {provider: index for index, provider in enumerate(_PROVIDER_NAMES)}
+        return sorted(
+            merged,
+            key=lambda value: (
+                provider_order.get(value, len(provider_order)),
+                value.casefold(),
+            ),
+        )
+
+    @classmethod
+    def _merge_source_names(cls, existing: list, incoming: list) -> list:
+        return cls._sort_provider_names((existing or []) + (incoming or []))
+
+    @classmethod
+    def _merge_string_list(
+        cls, existing: list, incoming: list, provider_statuses: dict[str, str]
+    ) -> list:
+        resolved = {
+            provider
+            for provider, status in provider_statuses.items()
+            if status in {"successful", "no_matching_record"}
+        }
+
+        def warning_provider(warning: str) -> str | None:
+            folded = warning.casefold()
+            for provider in _PROVIDER_NAMES:
+                if folded.startswith(
+                    (f"{provider} ".casefold(), f"{provider}:".casefold())
+                ):
+                    return provider
+            return None
+
+        retained = [
+            warning
+            for warning in existing or []
+            if isinstance(warning, str) and warning_provider(warning) not in resolved
+        ]
+        return sorted(
+            {
+                warning
+                for warning in retained + (incoming or [])
+                if isinstance(warning, str)
+            }
+        )
+
+    @classmethod
+    def _provider_statuses(
+        cls,
+        providers: list[str],
+        details: list,
+        warnings: list | None = None,
+        missing_status: str = "partial",
+    ) -> dict[str, str]:
+        statuses: dict[str, set[str]] = {provider: set() for provider in providers}
+        for detail in details:
+            if not isinstance(detail, dict) or not isinstance(detail.get("source"), str):
+                continue
+            provider = cls._provider_name(detail["source"])
+            status = detail.get("status")
+            if status == "available":
+                status = "successful"
+            if provider in statuses and status in _PROVIDER_STATUSES:
+                statuses[provider].add(status)
+
+        precedence = ("partial", "unavailable", "no_matching_record", "successful")
+        result = {}
+        for provider, observed in statuses.items():
+            status = next((item for item in precedence if item in observed), None)
+            if status is None:
+                status = (
+                    "unavailable"
+                    if any(
+                        isinstance(warning, str)
+                        and warning.casefold().startswith(provider.casefold())
+                        for warning in warnings or []
+                    )
+                    else missing_status
+                )
+            result[provider] = status
+        return result
+
+    @classmethod
+    def _merge_provider_details(
+        cls,
+        existing: list,
+        incoming: list,
+        updated_sources: list,
+        checked_at: str | None,
+        provider_statuses: dict[str, str],
+    ) -> list:
+        prior_by_key = {
+            (
+                cls._provider_name(detail["source"]),
+                detail.get("advisory_id"),
+            ): detail
+            for detail in (existing or [])
+            if isinstance(detail, dict) and isinstance(detail.get("source"), str)
+        }
+        merged = [
+            dict(detail)
+            for detail in (existing or [])
+            if isinstance(detail, dict)
+            and isinstance(detail.get("source"), str)
+            and cls._provider_name(detail.get("source", "")) not in set(updated_sources)
+        ]
+        for provider in updated_sources:
+            status = provider_statuses[provider]
+            provider_checked_at = next(
+                (
+                    detail.get("last_checked_at")
+                    for detail in incoming
+                    if isinstance(detail, dict)
+                    and isinstance(detail.get("source"), str)
+                    and cls._provider_name(detail["source"]) == provider
+                    and detail.get("last_checked_at")
+                ),
+                checked_at,
+            )
+            old_details = [
+                dict(detail)
+                for detail in (existing or [])
+                if isinstance(detail, dict)
+                and isinstance(detail.get("source"), str)
+                and cls._provider_name(detail["source"]) == provider
+            ]
+            details = []
+            if status in {"unavailable", "partial"}:
+                details = old_details or [{"source": provider}]
+                for detail in details:
+                    detail["status"] = status
+                    detail["last_checked_at"] = provider_checked_at
+                    detail["last_attempt_at"] = provider_checked_at
+                    detail["last_attempt_outcome"] = status
+            elif status == "unknown":
+                details = old_details
+                if not details:
+                    details = [
+                        dict(item)
+                        for item in incoming
+                        if isinstance(item, dict)
+                        and isinstance(item.get("source"), str)
+                        and cls._provider_name(item["source"]) == provider
+                    ] or [{"source": provider}]
+                    for detail in details:
+                        detail["status"] = "unknown"
+                merged.extend(details)
+            elif status == "no_matching_record":
+                detail = {
+                    "source": provider,
+                    "status": status,
+                    "last_checked_at": provider_checked_at,
+                    "last_attempt_at": provider_checked_at,
+                    "last_attempt_outcome": status,
+                    "last_successful_retrieval_at": provider_checked_at,
+                }
+                prior_payload_times = [
+                    item["last_successful_payload_at"]
+                    for item in old_details
+                    if item.get("last_successful_payload_at")
+                ]
+                if prior_payload_times:
+                    detail["last_successful_payload_at"] = max(prior_payload_times)
+                details = [detail]
+            else:
+                for item in incoming:
+                    if (
+                        not isinstance(item, dict)
+                        or not isinstance(item.get("source"), str)
+                        or cls._provider_name(item["source"]) != provider
+                    ):
+                        continue
+                    detail = dict(item)
+                    detail["status"] = status
+                    attempt_at = detail.get("last_checked_at") or checked_at
+                    detail["last_checked_at"] = attempt_at
+                    detail["last_attempt_at"] = attempt_at
+                    detail["last_attempt_outcome"] = status
+                    prior = prior_by_key.get((provider, detail.get("advisory_id")), {})
+                    for field in (
+                        "last_successful_retrieval_at",
+                        "last_successful_payload_at",
+                    ):
+                        if field in prior:
+                            detail[field] = prior[field]
+                    detail["last_successful_retrieval_at"] = attempt_at
+                    detail["last_successful_payload_at"] = attempt_at
+                    details.append(detail)
+                if not details:
+                    # The outcome was declared successful without a valid record detail.
+                    details = old_details or [{"source": provider}]
+                    for detail in details:
+                        detail["status"] = "partial"
+                        detail["last_checked_at"] = provider_checked_at
+                        detail["last_attempt_at"] = provider_checked_at
+                        detail["last_attempt_outcome"] = "partial"
+            merged.extend(details)
+
+        deduplicated = []
+        by_key = {}
+        for detail in sorted(
+            merged,
+            key=lambda item: (
+                cls._provider_name(item.get("source", "")),
+                item.get("advisory_id") or "",
+                json.dumps(item, sort_keys=True, separators=(",", ":"), default=str),
+            ),
+        ):
+            key = (
+                cls._provider_name(detail.get("source", "")),
+                detail.get("advisory_id"),
+            )
+            current = by_key.get(key)
+            if current is None:
+                copy = dict(detail)
+                by_key[key] = copy
+                deduplicated.append(copy)
+                continue
+            for field, value in detail.items():
+                if value is not None:
+                    current[field] = value
+        provider_order = {provider: index for index, provider in enumerate(_PROVIDER_NAMES)}
+        return sorted(
+            deduplicated,
+            key=lambda detail: (
+                provider_order.get(
+                    cls._provider_name(detail.get("source", "")),
+                    len(provider_order),
+                ),
+                detail.get("advisory_id") or "",
+                detail.get("source", ""),
+                json.dumps(detail, sort_keys=True, separators=(",", ":"), default=str),
+            ),
+        )
+
+    @staticmethod
     def _merge_refs(existing: list, incoming: list, refreshed_sources: list) -> list:
-        refreshed = set(refreshed_sources)
+        refreshed = {CVEDatabase._provider_name(source) for source in refreshed_sources}
 
         def was_refreshed(source: str) -> bool:
+            provider = CVEDatabase._provider_name(source)
             return any(
-                source == provider
-                or source.startswith(f"{provider} (")
-                for provider in refreshed
+                provider == updated
+                or provider.startswith(f"{updated} (")
+                for updated in refreshed
             )
 
         retained = []
@@ -386,18 +770,31 @@ class CVEDatabase:
             if not isinstance(ref, dict):
                 retained.append(ref)
                 continue
-            sources = ref.get("sources")
-            if not isinstance(sources, list) or not sources:
+            raw_sources = ref.get("sources") or ref.get("source")
+            if not raw_sources:
                 retained.append(ref)
                 continue
+            sources = (
+                raw_sources
+                if isinstance(raw_sources, list)
+                else str(raw_sources).split(" + ")
+            )
             remaining_sources = [
-                source for source in sources if not was_refreshed(source)
+                source
+                for source in sources
+                if not isinstance(source, str) or not was_refreshed(source)
             ]
             if not remaining_sources:
                 continue
             if len(remaining_sources) != len(sources):
                 ref = dict(ref)
-                ref["sources"] = remaining_sources
+                ref["sources"] = sorted(remaining_sources, key=lambda item: str(item).casefold())
+                ref["source"] = " + ".join(
+                    sorted(
+                        (source for source in remaining_sources if isinstance(source, str)),
+                        key=str.casefold,
+                    )
+                )
             retained.append(ref)
 
         merged = []
@@ -418,14 +815,18 @@ class CVEDatabase:
             existing_ref = by_url[url]
             sources = []
             for entry in (existing_ref, ref):
-                entry_sources = entry.get("sources") or []
+                entry_sources = entry.get("sources") or entry.get("source") or []
                 if not isinstance(entry_sources, list):
                     entry_sources = [entry_sources]
                 for source in entry_sources:
                     if source and source not in sources:
                         sources.append(source)
             if sources:
-                existing_ref["sources"] = sources
+                existing_ref["sources"] = sorted(
+                    sources,
+                    key=str.casefold,
+                )
+                existing_ref["source"] = " + ".join(existing_ref["sources"])
             if ref.get("untrusted"):
                 existing_ref["untrusted"] = True
                 existing_ref["trust_level"] = "unverified"
@@ -433,24 +834,38 @@ class CVEDatabase:
                 existing_ref["untrusted"] = False
             if not existing_ref.get("source") and ref.get("source"):
                 existing_ref["source"] = ref["source"]
-        return merged
+        return sorted(
+            merged,
+            key=lambda ref: (
+                ref.get("url", "") if isinstance(ref, dict) else "",
+                json.dumps(ref, sort_keys=True, separators=(",", ":"), default=str),
+            ),
+        )
 
     @staticmethod
     def _merge_affected_systems(
         existing: list, incoming: list, source: str | list, existing_source: str = ""
     ) -> list[dict]:
-        refreshed_sources = (
-            set(source)
-            if isinstance(source, list)
-            else set((source or "").split(" + "))
-        )
-        previous_sources = set((existing_source or "").split(" + "))
+        refreshed_sources = {
+            CVEDatabase._provider_name(item)
+            for item in (
+                source
+                if isinstance(source, list)
+                else (source or "").split(" + ")
+            )
+            if isinstance(item, str) and item
+        }
+        previous_sources = {
+            CVEDatabase._provider_name(item)
+            for item in (existing_source or "").split(" + ")
+            if item
+        }
 
         def was_refreshed(provider: str) -> bool:
             return any(
-                provider == source
-                or provider.startswith(f"{source} (")
-                for source in refreshed_sources
+                provider == refreshed
+                or provider.startswith(f"{refreshed} (")
+                for refreshed in refreshed_sources
             )
 
         existing = existing if isinstance(existing, list) else []
@@ -461,7 +876,7 @@ class CVEDatabase:
                 continue
             raw_sources = system.get("sources") or system.get("source")
             if not raw_sources:
-                if refreshed_sources & previous_sources:
+                if len(previous_sources) == 1 and previous_sources <= refreshed_sources:
                     continue
                 retained.append(system)
                 continue
@@ -513,6 +928,7 @@ class CVEDatabase:
                     if item and item not in sources:
                         sources.append(item)
             if sources:
+                sources.sort(key=str.casefold)
                 existing_system["source"] = " + ".join(sources)
                 if len(sources) > 1:
                     existing_system["sources"] = sources
@@ -523,7 +939,13 @@ class CVEDatabase:
             )
             if existing_system["untrusted"]:
                 existing_system["trust_level"] = "unverified"
-        return systems
+        return sorted(
+            systems,
+            key=lambda system: (
+                *(str(system.get(field, "")) for field in key_fields),
+                json.dumps(system, sort_keys=True, separators=(",", ":"), default=str),
+            ),
+        )
 
     def log_update(self, count: int, success: bool):
         with self._connection() as conn:

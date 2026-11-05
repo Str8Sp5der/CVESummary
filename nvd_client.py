@@ -47,9 +47,17 @@ class CISAKEVUpdateError(RuntimeError):
 class CVEUpstreamError(RuntimeError):
     """Raised when upstream sources cannot answer a CVE request."""
 
-    def __init__(self, message: str, sources: list[str] | None = None):
+    def __init__(
+        self,
+        message: str,
+        sources: list[str] | None = None,
+        outcomes: dict[str, str] | None = None,
+        attempted_at: dict[str, str] | None = None,
+    ):
         super().__init__(message)
         self.sources = sources or []
+        self.outcomes = outcomes or {}
+        self.attempted_at = attempted_at or {}
 
 
 def _sanitize(text: str, max_len: int = 4000) -> str:
@@ -91,6 +99,8 @@ class NVDClient:
         cisa_kev_record = None
         failed_sources = []
         attempted_sources = []
+        provider_outcomes = {}
+        provider_attempted_at = {}
         try:
             attempted_sources.append("NVD")
             resp = self.session.get(
@@ -121,6 +131,14 @@ class NVDClient:
         except (requests.RequestException, ValueError) as exc:
             log.warning("NVD fetch failed for %s: %s", cve_id, exc)
             failed_sources.append("NVD")
+            provider_outcomes["NVD"] = (
+                "partial" if isinstance(exc, ValueError) else "unavailable"
+            )
+        else:
+            provider_outcomes["NVD"] = (
+                "successful" if nvd_record else "no_matching_record"
+            )
+        provider_attempted_at["NVD"] = datetime.now(timezone.utc).isoformat()
 
         try:
             attempted_sources.append("MITRE")
@@ -128,6 +146,14 @@ class NVDClient:
         except (requests.RequestException, ValueError) as exc:
             log.warning("MITRE CVE record lookup failed for %s: %s", cve_id, exc)
             failed_sources.append("MITRE")
+            provider_outcomes["MITRE"] = (
+                "partial" if isinstance(exc, ValueError) else "unavailable"
+            )
+        else:
+            provider_outcomes["MITRE"] = (
+                "successful" if mitre_record else "no_matching_record"
+            )
+        provider_attempted_at["MITRE"] = datetime.now(timezone.utc).isoformat()
 
         try:
             attempted_sources.append("OSV")
@@ -135,6 +161,14 @@ class NVDClient:
         except (requests.RequestException, ValueError) as exc:
             log.warning("OSV vulnerability lookup failed for %s: %s", cve_id, exc)
             failed_sources.append("OSV")
+            provider_outcomes["OSV"] = (
+                "partial" if isinstance(exc, ValueError) else "unavailable"
+            )
+        else:
+            provider_outcomes["OSV"] = (
+                "successful" if osv_record else "no_matching_record"
+            )
+        provider_attempted_at["OSV"] = datetime.now(timezone.utc).isoformat()
 
         try:
             attempted_sources.append("GitHub Advisory")
@@ -142,6 +176,14 @@ class NVDClient:
         except (requests.RequestException, ValueError) as exc:
             log.warning("GitHub Advisory lookup failed for %s: %s", cve_id, exc)
             failed_sources.append("GitHub Advisory")
+            provider_outcomes["GitHub Advisory"] = (
+                "partial" if isinstance(exc, ValueError) else "unavailable"
+            )
+        else:
+            provider_outcomes["GitHub Advisory"] = (
+                "successful" if github_record else "no_matching_record"
+            )
+        provider_attempted_at["GitHub Advisory"] = datetime.now(timezone.utc).isoformat()
 
         try:
             attempted_sources.append("Red Hat Security Data")
@@ -149,6 +191,14 @@ class NVDClient:
         except (requests.RequestException, ValueError) as exc:
             log.warning("Red Hat Security Data lookup failed for %s: %s", cve_id, exc)
             failed_sources.append("Red Hat Security Data")
+            provider_outcomes["Red Hat Security Data"] = (
+                "partial" if isinstance(exc, ValueError) else "unavailable"
+            )
+        else:
+            provider_outcomes["Red Hat Security Data"] = (
+                "successful" if redhat_record else "no_matching_record"
+            )
+        provider_attempted_at["Red Hat Security Data"] = datetime.now(timezone.utc).isoformat()
 
         try:
             attempted_sources.append("CISA KEV")
@@ -156,6 +206,14 @@ class NVDClient:
         except (requests.RequestException, ValueError) as exc:
             log.warning("CISA KEV lookup failed for %s: %s", cve_id, exc)
             failed_sources.append("CISA KEV")
+            provider_outcomes["CISA KEV"] = (
+                "partial" if isinstance(exc, ValueError) else "unavailable"
+            )
+        else:
+            provider_outcomes["CISA KEV"] = (
+                "successful" if cisa_kev_record else "no_matching_record"
+            )
+        provider_attempted_at["CISA KEV"] = datetime.now(timezone.utc).isoformat()
 
         if nvd_record and mitre_record:
             parsed = self._merge_records(nvd_record, mitre_record)
@@ -184,11 +242,15 @@ class NVDClient:
                     "CVE sources are temporarily unavailable: "
                     + ", ".join(failed_sources)
                     + ". Please try again.",
-                    attempted_sources,
+                    failed_sources,
+                    provider_outcomes,
+                    provider_attempted_at,
                 )
             return None
 
         parsed["sources_checked"] = attempted_sources
+        parsed["provider_updates"] = attempted_sources
+        fetched_at = datetime.now(timezone.utc).isoformat()
         source_details = {}
         source_records = {
             "NVD": nvd_record,
@@ -215,14 +277,18 @@ class NVDClient:
                         }
                     ]
                 for detail in details:
+                    detail = dict(detail)
+                    detail["status"] = provider_outcomes[source]
+                    detail["last_checked_at"] = provider_attempted_at[source]
                     key = (detail["source"], detail.get("advisory_id"))
                     source_details[key] = detail
-            elif source in failed_sources:
+            elif provider_outcomes[source] in {"unavailable", "partial"}:
                 source_details[(source, None)] = {
                     "source": source,
                     "trust_level": "unknown",
                     "untrusted": False,
-                    "status": "unavailable",
+                    "status": provider_outcomes[source],
+                    "last_checked_at": provider_attempted_at[source],
                 }
             else:
                 source_details[(source, None)] = {
@@ -230,23 +296,44 @@ class NVDClient:
                     "trust_level": "unknown",
                     "untrusted": False,
                     "status": "no_matching_record",
+                    "last_checked_at": provider_attempted_at[source],
                 }
         parsed["source_details"] = list(source_details.values())
         parsed["source_warnings"] = [
-            f"{source} could not be reached; its metadata may be missing."
-            for source in failed_sources
+            (
+                f"{source} returned incomplete data; previous metadata was retained."
+                if provider_outcomes[source] == "partial"
+                else f"{source} could not be reached; its metadata may be missing."
+            )
+            for source in attempted_sources
+            if provider_outcomes[source] in {"unavailable", "partial"}
         ]
-        fetched_at = datetime.now(timezone.utc).isoformat()
         parsed["source_records"] = [
             observation
             for record in source_records.values()
             if record
             for observation in record.get("source_records", [])
         ]
+        for source, record in source_records.items():
+            if record:
+                continue
+            status = provider_outcomes[source]
+            observation = self._source_observation(
+                source,
+                "retrieval-status",
+                {
+                    "retrieval_status": status,
+                    "retrieved_at": provider_attempted_at[source],
+                },
+                trust_level="unknown",
+                review_status=status,
+                claims={"retrieval_status": status},
+            )
+            observation["retrieved_at"] = provider_attempted_at[source]
+            parsed["source_records"].append(observation)
         for observation in parsed["source_records"]:
             observation.setdefault("retrieved_at", fetched_at)
         for detail in parsed["source_details"]:
-            detail["last_checked_at"] = fetched_at
             provider = next(
                 (
                     source
@@ -269,9 +356,12 @@ class NVDClient:
                 ]
             if matching_observations:
                 observation = matching_observations[-1]
+                detail["last_checked_at"] = observation.get("retrieved_at") or fetched_at
                 detail["source_updated_at"] = observation.get("source_updated_at")
                 if observation.get("review_status"):
                     detail["review_status"] = observation["review_status"]
+            else:
+                detail["last_checked_at"] = provider_attempted_at.get(provider, fetched_at)
         parsed["poc"] = self._collect_poc(cve_id)
         return parsed
 
@@ -411,47 +501,40 @@ class NVDClient:
                 count += 1
             checked_at = datetime.now(timezone.utc).isoformat()
             for cve_id in stale_ids:
-                cached = db.get_cve(cve_id)
-                if not cached:
-                    continue
-                cached["cisa_kev"] = None
-                cached["sources_checked"] = list(
-                    dict.fromkeys((cached.get("sources_checked") or []) + ["CISA KEV"])
-                )
-                cached["source_details"] = [
-                    detail
-                    for detail in (cached.get("source_details") or [])
-                    if not isinstance(detail, dict)
-                    or detail.get("source") != "CISA KEV"
-                ] + [
+                db.store_cve(
                     {
-                        "source": "CISA KEV",
-                        "trust_level": "authoritative",
-                        "untrusted": False,
-                        "status": "no_matching_record",
-                        "last_checked_at": checked_at,
+                        "id": cve_id,
+                        "source": "",
+                        "provider_updates": ["CISA KEV"],
+                        "sources_checked": ["CISA KEV"],
+                        "source_details": [
+                            {
+                                "source": "CISA KEV",
+                                "status": "no_matching_record",
+                            }
+                        ],
+                        "source_warnings": [],
+                        "cisa_kev": None,
+                        "source_records": [
+                            self._source_observation(
+                                "CISA KEV",
+                                cve_id,
+                                {
+                                    "cveID": cve_id,
+                                    "status": "removed from current catalog",
+                                },
+                                trust_level="authoritative",
+                                review_status="not listed in current KEV catalog",
+                                claims={
+                                    "description": "",
+                                    "cvss": {},
+                                    "affected_count": 0,
+                                },
+                            )
+                        ],
+                        "fetched_at": checked_at,
                     }
-                ]
-                cached["refs"] = [
-                    ref
-                    for ref in (cached.get("refs") or [])
-                    if not (
-                        isinstance(ref, dict)
-                        and "CISA KEV" in (ref.get("sources") or [ref.get("source")])
-                    )
-                ]
-                cached["source_records"] = [
-                    self._source_observation(
-                        "CISA KEV",
-                        cve_id,
-                        {"cveID": cve_id, "status": "removed from current catalog"},
-                        trust_level="authoritative",
-                        review_status="not listed in current KEV catalog",
-                        claims={"description": "", "cvss": {}, "affected_count": 0},
-                    )
-                ]
-                cached["fetched_at"] = checked_at
-                db.store_cve(cached)
+                )
                 count += 1
         except (requests.RequestException, ValueError) as exc:
             db.log_source_sync(
@@ -509,9 +592,11 @@ class NVDClient:
                     "source": source_name,
                     "trust_level": "authoritative",
                     "untrusted": False,
+                    "status": "successful",
                     "last_checked_at": now.isoformat(),
                 }
             ],
+            "provider_updates": [source_name],
             "sources_checked": [source_name],
             "source_warnings": [],
             "fetched_at": now.isoformat(),
@@ -599,8 +684,10 @@ class NVDClient:
                     "source": "OSV",
                     "trust_level": "secondary",
                     "untrusted": False,
+                    "status": "successful",
                 }
             ],
+            "provider_updates": ["OSV"],
             "sources_checked": ["OSV"],
             "source_warnings": [],
             "fetched_at": datetime.now(timezone.utc).isoformat(),
@@ -664,6 +751,7 @@ class NVDClient:
                 "source": source_name,
                 "trust_level": "authoritative",
                 "untrusted": False,
+                "status": "successful",
                 "record_type": "vendor",
             }
         ]
@@ -808,6 +896,7 @@ class NVDClient:
             "poc": [],
             "source": source_name,
             "source_details": source_details,
+            "provider_updates": [source_name],
             "sources_checked": [source_name],
             "source_warnings": [],
             "fetched_at": datetime.now(timezone.utc).isoformat(),
@@ -874,6 +963,7 @@ class NVDClient:
                     "source": source_name,
                     "trust_level": trust_level,
                     "untrusted": not reviewed,
+                    "status": "successful",
                     "record_type": advisory_type or "unknown",
                     "advisory_id": advisory.get("ghsa_id"),
                 }
@@ -983,6 +1073,7 @@ class NVDClient:
             "poc": [],
             "source": combined_source,
             "source_details": source_details,
+            "provider_updates": ["GitHub Advisory"],
             "sources_checked": ["GitHub Advisory"],
             "source_warnings": [],
             "fetched_at": datetime.now(timezone.utc).isoformat(),
@@ -1127,6 +1218,37 @@ class NVDClient:
             "CISA KEV",
         }
         if not required_sources.issubset(sources_checked):
+            return True
+        provider_details = [
+            detail
+            for detail in cve.get("source_details") or []
+            if isinstance(detail, dict)
+        ]
+        provider_statuses = {
+            "successful"
+            if detail.get("status") == "available"
+            else detail.get("status")
+            for detail in provider_details
+        }
+        successful_providers = {
+            provider
+            for provider, status in (
+                (detail.get("source"), detail.get("status"))
+                for detail in provider_details
+            )
+            if status in {"successful", "available"}
+        }
+        retained_unsuccessful_data = any(
+            detail.get("status")
+            in {"unavailable", "partial", "no_matching_record"}
+            and detail.get("last_successful_payload_at")
+            for detail in provider_details
+        )
+        if retained_unsuccessful_data or (
+            not successful_providers
+            and provider_statuses
+            & {"unavailable", "partial", "no_matching_record"}
+        ):
             return True
         if has_cvss and has_affected_versions and not cve.get("source_warnings"):
             return False
@@ -1405,8 +1527,10 @@ class NVDClient:
                     "source": "NVD",
                     "trust_level": "authoritative",
                     "untrusted": False,
+                    "status": "successful",
                 }
             ],
+            "provider_updates": ["NVD"],
             "sources_checked":  ["NVD"],
             "source_warnings":  [],
             "fetched_at":       datetime.now(timezone.utc).isoformat(),
@@ -1547,6 +1671,7 @@ class NVDClient:
                     "source": "MITRE/CNA",
                     "trust_level": "authoritative",
                     "untrusted": False,
+                    "status": "successful",
                 },
                 *[
                     {
@@ -1557,10 +1682,12 @@ class NVDClient:
                             else "secondary"
                         ),
                         "untrusted": False,
+                        "status": "successful",
                     }
                     for provider in adp
                 ],
             ],
+            "provider_updates": ["MITRE"],
             "sources_checked":  ["MITRE"],
             "source_warnings":  [],
             "fetched_at":       datetime.now(timezone.utc).isoformat(),

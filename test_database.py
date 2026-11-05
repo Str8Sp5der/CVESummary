@@ -103,7 +103,20 @@ class CVEDatabaseTests(unittest.TestCase):
             del db
 
         self.assertEqual(cve["sources_checked"], ["NVD", "MITRE", "OSV"])
-        self.assertTrue(cve["source_details"][0]["untrusted"])
+        github_detail = next(
+            detail
+            for detail in cve["source_details"]
+            if detail["source"] == "GitHub Advisory (unreviewed)"
+        )
+        self.assertTrue(github_detail["untrusted"])
+        self.assertEqual(
+            next(
+                detail["status"]
+                for detail in cve["source_details"]
+                if detail["source"] == "OSV"
+            ),
+            "unavailable",
+        )
         self.assertEqual(cve["source_warnings"], ["OSV could not be reached."])
 
     def test_source_observations_keep_changed_snapshots_and_deduplicate_repeats(self):
@@ -134,12 +147,19 @@ class CVEDatabaseTests(unittest.TestCase):
                 "source_records": [observation],
             }
             db.store_cve(data)
+            observation["retrieved_at"] = "2026-01-03T00:00:00+00:00"
             db.store_cve(data)
+            repeated = db.get_cve("CVE-2026-1234")["source_observations"][0]
+            self.assertEqual(
+                repeated["retrieved_at"],
+                "2026-01-03T00:00:00+00:00",
+            )
             observation["payload"] = {
                 "id": "CVE-2026-1234",
                 "vulnStatus": "Modified",
             }
             observation["source_updated_at"] = "2026-01-04T00:00:00.000"
+            observation["retrieved_at"] = "2026-01-04T00:00:00+00:00"
             db.store_cve(data)
 
             cve = db.get_cve("CVE-2026-1234")
@@ -216,6 +236,8 @@ class CVEDatabaseTests(unittest.TestCase):
                 {
                     "id": "CVE-2026-1234",
                     "source": "NVD",
+                    "provider_updates": ["NVD"],
+                    "source_details": [{"source": "NVD", "status": "successful"}],
                     "untrusted": False,
                     "affected_systems": [
                         {
@@ -249,7 +271,6 @@ class CVEDatabaseTests(unittest.TestCase):
         self.assertEqual(
             {ref["url"] for ref in cve["refs"]},
             {
-                "https://nvd.example/cve",
                 "https://osv.example/cve",
                 "https://nvd.example/updated",
             },
@@ -320,6 +341,8 @@ class CVEDatabaseTests(unittest.TestCase):
                     "id": "CVE-2026-1234",
                     "source": "NVD",
                     "sources_checked": ["NVD"],
+                    "provider_updates": ["NVD"],
+                    "source_details": [{"source": "NVD", "status": "successful"}],
                     "refs": [
                         {
                             "url": "https://nvd.example/new",
@@ -343,7 +366,7 @@ class CVEDatabaseTests(unittest.TestCase):
         self.assertIn("https://osv.example/advisory", refs)
         self.assertEqual(
             refs["https://nvd.example/shared"]["sources"],
-            ["OSV", "NVD"],
+            ["NVD", "OSV"],
         )
 
     def test_refresh_removes_affected_entries_from_a_checked_source(self):
@@ -377,6 +400,11 @@ class CVEDatabaseTests(unittest.TestCase):
                     "id": "CVE-2026-1234",
                     "source": "MITRE",
                     "sources_checked": ["MITRE", "GitHub Advisory"],
+                    "provider_updates": ["MITRE", "GitHub Advisory"],
+                    "source_details": [
+                        {"source": "MITRE", "status": "successful"},
+                        {"source": "GitHub Advisory", "status": "successful"},
+                    ],
                     "affected_systems": [
                         {
                             "vendor": "Acme",
@@ -426,6 +454,10 @@ class CVEDatabaseTests(unittest.TestCase):
                     "id": "CVE-2026-1234",
                     "source": "GitHub Advisory",
                     "sources_checked": ["GitHub Advisory"],
+                    "provider_updates": ["GitHub Advisory"],
+                    "source_details": [
+                        {"source": "GitHub Advisory", "status": "successful"}
+                    ],
                     "affected_systems": [],
                     "refs": [],
                 }
@@ -497,6 +529,8 @@ class CVEDatabaseTests(unittest.TestCase):
                 {
                     "id": "CVE-2026-1234",
                     "source": "NVD",
+                    "provider_updates": ["NVD"],
+                    "source_details": [{"source": "NVD", "status": "successful"}],
                     "affected_systems": [
                         {
                             "vendor": "Acme",
@@ -510,6 +544,8 @@ class CVEDatabaseTests(unittest.TestCase):
                 {
                     "id": "CVE-2026-1234",
                     "source": "NVD",
+                    "provider_updates": ["NVD"],
+                    "source_details": [{"source": "NVD", "status": "successful"}],
                     "affected_systems": [
                         {
                             "vendor": "Acme",

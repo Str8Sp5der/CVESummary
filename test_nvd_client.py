@@ -98,6 +98,63 @@ class NVDClientTests(unittest.TestCase):
         self.assertEqual(kwargs["params"], {"cveId": "CVE-2026-1234"})
         self.assertEqual(kwargs["headers"], {"apiKey": "test-key"})
 
+    def test_fetch_records_successful_no_record_provider_outcomes(self):
+        client = NVDClient()
+        client.session.get = Mock(
+            return_value=response(
+                {"vulnerabilities": [{"cve": nvd_record("CVE-2026-1234")}]}
+            )
+        )
+        with patch.object(client, "_fetch_mitre_cve", return_value=None), patch.object(
+            client, "_fetch_osv_cve", return_value=None
+        ), patch.object(client, "_fetch_github_advisory", return_value=None), patch.object(
+            client, "_fetch_redhat_cve", return_value=None
+        ), patch.object(client, "_fetch_cisa_kev", return_value=None), patch.object(
+            client, "_collect_poc", return_value=[]
+        ):
+            cve = client.fetch_cve("CVE-2026-1234")
+
+        retrieval_outcomes = {
+            record["source"]: record["claims"]["retrieval_status"]
+            for record in cve["source_records"]
+            if record["record_id"] == "retrieval-status"
+        }
+        self.assertEqual(
+            retrieval_outcomes,
+            {
+                "MITRE": "no_matching_record",
+                "OSV": "no_matching_record",
+                "GitHub Advisory": "no_matching_record",
+                "Red Hat Security Data": "no_matching_record",
+                "CISA KEV": "no_matching_record",
+            },
+        )
+
+    def test_upstream_error_tracks_each_provider_attempt_time(self):
+        client = NVDClient()
+        client.session.get = Mock(side_effect=requests.Timeout("upstream timeout"))
+        with patch.object(client, "_fetch_mitre_cve", return_value=None), patch.object(
+            client, "_fetch_osv_cve", return_value=None
+        ), patch.object(client, "_fetch_github_advisory", return_value=None), patch.object(
+            client, "_fetch_redhat_cve", return_value=None
+        ), patch.object(client, "_fetch_cisa_kev", return_value=None):
+            with self.assertRaises(CVEUpstreamError) as raised:
+                client.fetch_cve("CVE-2026-1234")
+
+        self.assertEqual(
+            set(raised.exception.attempted_at),
+            {
+                "NVD",
+                "MITRE",
+                "OSV",
+                "GitHub Advisory",
+                "Red Hat Security Data",
+                "CISA KEV",
+            },
+        )
+        for timestamp in raised.exception.attempted_at.values():
+            datetime.fromisoformat(timestamp)
+
     def test_falls_back_to_mitre_when_nvd_has_no_matching_record(self):
         client = NVDClient()
         client.session.get = Mock(
@@ -172,8 +229,25 @@ class NVDClientTests(unittest.TestCase):
             {"GHSA-1111", "GHSA-2222"},
         )
         self.assertEqual(
-            {record["source"] for record in cve["source_records"]},
+            {
+                record["source"]
+                for record in cve["source_records"]
+                if record["record_id"] != "retrieval-status"
+            },
             {"MITRE", "GitHub Advisory"},
+        )
+        self.assertEqual(
+            {
+                record["source"]: record["claims"]["retrieval_status"]
+                for record in cve["source_records"]
+                if record["record_id"] == "retrieval-status"
+            },
+            {
+                "NVD": "no_matching_record",
+                "OSV": "no_matching_record",
+                "Red Hat Security Data": "no_matching_record",
+                "CISA KEV": "no_matching_record",
+            },
         )
         self.assertTrue(
             all(detail.get("last_checked_at") for detail in cve["source_details"])

@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta http-equiv="X-Content-Type-Options" content="nosniff">
+<meta name="csrf-token" content="{{ csrf_token() }}">
 <title>CVE Intel — Vulnerability Intelligence Platform</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -937,9 +938,6 @@ main {
       <button class="btn-refresh" id="btnLogin" title="Login">🔐 Login</button>
       <button class="btn-refresh" id="btnRegister" title="Register">✔ Register</button>
       <button class="btn-refresh" id="btnLogout" title="Logout" style="display:none;">⇦ Logout</button>
-      <button class="btn-refresh" id="triggerUpdate" title="Sync NVD updates and the CISA KEV catalog">
-        ↻ Sync Feeds
-      </button>
     </div>
   </header>
 
@@ -1032,7 +1030,6 @@ const loadingState  = document.getElementById("loadingState");
 const errorState    = document.getElementById("errorState");
 const statTotal     = document.getElementById("statTotal");
 const statCritical  = document.getElementById("statCritical");
-const triggerUpdate = document.getElementById("triggerUpdate");
 
 // ── Utilities ────────────────────────────────────────────
 /** Safe text setter — never eval, never innerHTML with user data */
@@ -1066,8 +1063,15 @@ function truncate(str, n) {
 }
 
 // ── API helpers ──────────────────────────────────────────
-async function apiFetch(url) {
-  const res = await fetch(url, { credentials: 'same-origin' });
+async function apiFetch(url, options = {}) {
+  const requestOptions = { credentials: 'same-origin', ...options };
+  const method = (requestOptions.method || 'GET').toUpperCase();
+  if (!['GET', 'HEAD', 'OPTIONS'].includes(method)) {
+    const headers = new Headers(requestOptions.headers || {});
+    headers.set('X-CSRFToken', document.querySelector('meta[name="csrf-token"]').content);
+    requestOptions.headers = headers;
+  }
+  const res = await fetch(url, requestOptions);
   const data = await res.json();
   if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
   return data;
@@ -1094,7 +1098,6 @@ function updateAuthUI() {
   const loginBtn  = document.getElementById('btnLogin');
   const registerBtn = document.getElementById('btnRegister');
   const logoutBtn = document.getElementById('btnLogout');
-
   if (isAuthenticated) {
     userStatus.textContent = `Signed in as ${currentUser}`;
     loginBtn.style.display = 'none';
@@ -1146,14 +1149,11 @@ async function submitAuthForm(evt) {
 
   try {
     if (authMode === 'register') {
-      const resp = await fetch('/api/register', {
+      const data = await apiFetch('/api/register', {
         method: 'POST',
-        credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ username, password }),
       });
-      const data = await resp.json();
-      if (!resp.ok) throw new Error(data.error || data.message || `HTTP ${resp.status}`);
       authMessage.textContent = 'Registration successful! Please log in.';
       authMode = 'login';
       authModalTitle.textContent = 'User Login';
@@ -1161,14 +1161,11 @@ async function submitAuthForm(evt) {
       return;
     }
 
-    const resp = await fetch('/api/login', {
+    const data = await apiFetch('/api/login', {
       method: 'POST',
-      credentials: 'same-origin',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ username, password }),
     });
-    const data = await resp.json();
-    if (!resp.ok) throw new Error(data.error || data.message || `HTTP ${resp.status}`);
     authMessage.textContent = 'Login successful!';
     closeAuthModal();
     await checkAuthStatus();
@@ -1180,15 +1177,14 @@ async function submitAuthForm(evt) {
 
 async function performLogout() {
   try {
-    const resp = await fetch('/api/logout', { method: 'POST', credentials: 'same-origin' });
-    if (!resp.ok) throw new Error('Logout failed.');
-  } catch (err) {
-    // ignore
-  } finally {
+    await apiFetch('/api/logout', { method: 'POST' });
     isAuthenticated = false;
     currentUser = null;
     updateAuthUI();
     loadCVE(activeCveId);
+  } catch (err) {
+    openAuthModal('login');
+    authMessage.textContent = err.message;
   }
 }
 
@@ -1291,7 +1287,7 @@ async function loadCVE(cveId) {
   mainSearch.value = normalized;
 
   try {
-    const data = await apiFetch(`/api/cve/${encodeURIComponent(normalized)}`);
+    const data = await apiFetch(`/api/cve/${encodeURIComponent(normalized)}`, { method: 'POST' });
     showDetail(data);
     loadStats();
     // Refresh sidebar if this is a new CVE
@@ -1479,9 +1475,13 @@ function renderCVE(data) {
   const refreshBtn = el("button", "refresh-cve-btn");
   setText(refreshBtn, "↻ Refresh");
   refreshBtn.addEventListener("click", async () => {
+    if (!isAuthenticated) {
+      openAuthModal('login');
+      return;
+    }
     setText(refreshBtn, "Refreshing…");
     try {
-      const fresh = await apiFetch(`/api/cve/${encodeURIComponent(data.id)}/refresh`);
+      const fresh = await apiFetch(`/api/cve/${encodeURIComponent(data.id)}/refresh`, { method: 'POST' });
       showDetail(fresh);
     } catch(e) { showError(e.message); }
   });
@@ -1977,25 +1977,6 @@ mainSearch.addEventListener("keydown", e => {
 });
 document.addEventListener("click", e => {
   if (!e.target.closest(".header-search")) closeDropdown();
-});
-
-// ── Sync button ──────────────────────────────────────────
-triggerUpdate.addEventListener("click", async () => {
-  triggerUpdate.classList.add("spinning");
-  triggerUpdate.disabled = true;
-  try {
-    const r = await apiFetch("/api/trigger-update");
-    await loadRecent();
-    await loadStats();
-    triggerUpdate.textContent = "✓ Synced";
-    setTimeout(() => { triggerUpdate.textContent = "↻ Sync Feeds"; }, 2500);
-  } catch (e) {
-    triggerUpdate.textContent = "⚠ Failed";
-    setTimeout(() => { triggerUpdate.textContent = "↻ Sync Feeds"; }, 2500);
-  } finally {
-    triggerUpdate.classList.remove("spinning");
-    triggerUpdate.disabled = false;
-  }
 });
 
 // ── Init ─────────────────────────────────────────────────
