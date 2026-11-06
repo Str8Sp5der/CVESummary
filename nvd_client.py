@@ -145,11 +145,19 @@ class NVDClient:
             )
         provider_attempted_at["NVD"] = datetime.now(timezone.utc).isoformat()
 
+        mitre_api_error = None
         try:
             attempted_sources.append("MITRE")
             mitre_record = self._fetch_mitre_cve(cve_id)
         except (requests.RequestException, ValueError) as exc:
             log.warning("MITRE CVE record lookup failed for %s: %s", cve_id, exc)
+            mitre_api_error = exc
+
+        # CVE Services and cvelistV5 are separate delivery paths for the same
+        # CVE Program record. Check the mirror both when the API errors and
+        # when it returns 404/no record; the latter can occur during API or
+        # publication propagation gaps.
+        if not mitre_record:
             try:
                 mitre_record = self._fetch_cvelistv5_cve(cve_id)
             except (requests.RequestException, ValueError) as fallback_exc:
@@ -161,22 +169,24 @@ class NVDClient:
                 failed_sources.append("MITRE")
                 provider_outcomes["MITRE"] = (
                     "partial"
-                    if isinstance(exc, ValueError)
+                    if isinstance(mitre_api_error, ValueError)
                     or isinstance(fallback_exc, ValueError)
                     else "unavailable"
                 )
             else:
                 if mitre_record:
                     provider_outcomes["MITRE"] = "successful"
-                else:
+                elif mitre_api_error:
                     failed_sources.append("MITRE")
                     provider_outcomes["MITRE"] = (
-                        "partial" if isinstance(exc, ValueError) else "unavailable"
+                        "partial"
+                        if isinstance(mitre_api_error, ValueError)
+                        else "unavailable"
                     )
+                else:
+                    provider_outcomes["MITRE"] = "no_matching_record"
         else:
-            provider_outcomes["MITRE"] = (
-                "successful" if mitre_record else "no_matching_record"
-            )
+            provider_outcomes["MITRE"] = "successful"
         provider_attempted_at["MITRE"] = datetime.now(timezone.utc).isoformat()
 
         try:
@@ -1262,8 +1272,14 @@ class NVDClient:
                         existing["trust_level"] = "unverified"
             merged[field] = values
 
-        if merged.get("description") == "No description available.":
-            merged["description"] = mitre_record.get("description", merged["description"])
+        primary_description = str(nvd_record.get("description") or "").strip()
+        secondary_description = str(mitre_record.get("description") or "").strip()
+        if (
+            primary_description in {"", "No description available."}
+            and secondary_description
+            and secondary_description != "No description available."
+        ):
+            merged["description"] = secondary_description
         for field in ("published", "modified"):
             merged[field] = nvd_record.get(field) or mitre_record.get(field, "")
 
