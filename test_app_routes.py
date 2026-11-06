@@ -1,6 +1,6 @@
 import pytest
 
-from conftest import authenticate, csrf_token
+from conftest import csrf_token
 
 
 PROVIDERS = [
@@ -46,10 +46,9 @@ def _seed_complete_record(application):
     )
 
 
-def test_refresh_is_post_only_authenticated_and_csrf_protected(application):
+def test_refresh_is_post_only_public_and_csrf_protected(application):
     client = application.app.test_client()
     token = csrf_token(client)
-    authenticate(application, client)
     refresh_path = "/api/cve/CVE-2026-1234/refresh"
 
     get_response = client.get(refresh_path)
@@ -73,23 +72,16 @@ def test_refresh_is_post_only_authenticated_and_csrf_protected(application):
     assert response.get_json()["cache"] == "REFRESHED"
 
 
-def test_refresh_requires_authentication_and_sync_is_disabled(application):
+def test_refresh_is_available_without_account_and_sync_remains_disabled(application):
     client = application.app.test_client()
     token = csrf_token(client)
     headers = {"X-CSRFToken": token}
 
-    refresh_response = client.post(
-        "/api/cve/CVE-2026-1234/refresh",
-        headers=headers,
-    )
-    assert refresh_response.status_code == 401
-
-    sync_response = client.post("/api/trigger-update", headers=headers)
-    assert sync_response.status_code == 401
-
-    authenticate(application, client)
     sync_response = client.post("/api/trigger-update", headers=headers)
     assert sync_response.status_code == 403
+    assert sync_response.get_json() == {
+        "error": "Manual feed synchronization is disabled."
+    }
 
 
 def test_cache_miss_get_is_read_only_and_post_fetches(application):
@@ -121,20 +113,16 @@ def test_cache_miss_get_is_read_only_and_post_fetches(application):
     assert calls == ["CVE-2026-1234"]
 
 
-def test_logout_requires_csrf_token(application):
+def test_account_endpoints_are_removed(application):
     client = application.app.test_client()
-    token = csrf_token(client)
-    authenticate(application, client)
-
-    missing_token_response = client.post("/api/logout")
-    assert missing_token_response.status_code == 400
-
-    logout_response = client.post(
-        "/api/logout",
-        headers={"X-CSRFToken": token},
-    )
-    assert logout_response.status_code == 200
-    assert logout_response.get_json() == {"message": "Logout successful."}
+    for path, method in (
+        ("/api/register", "post"),
+        ("/api/login", "post"),
+        ("/api/logout", "post"),
+        ("/api/auth/status", "get"),
+    ):
+        response = getattr(client, method)(path)
+        assert response.status_code == 404
 
 
 def test_stale_cache_records_provider_attempt_without_losing_success(application):
@@ -337,7 +325,6 @@ def test_uncached_mixed_provider_outcomes_are_returned_with_503(application):
 
 def test_poc_upstream_failure_returns_service_unavailable(application):
     client = application.app.test_client()
-    authenticate(application, client)
 
     def fail_fetch(_cve_id):
         raise application.CVEUpstreamError("Upstream unavailable.")

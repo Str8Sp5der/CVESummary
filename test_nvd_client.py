@@ -10,6 +10,7 @@ from database import CVEDatabase
 from nvd_client import (
     CISA_KEV_FEED,
     CISAKEVUpdateError,
+    CVELISTV5_RAW,
     MITRE_CVE_API,
     NVD_API,
     OSV_API,
@@ -59,10 +60,55 @@ def nvd_record(cve_id: str) -> dict:
     }
 
 
+def cvelistv5_record(cve_id: str) -> dict:
+    return {
+        "dataType": "CVE_RECORD",
+        "dataVersion": "5.2",
+        "cveMetadata": {
+            "cveId": cve_id,
+            "state": "PUBLISHED",
+            "datePublished": "2026-01-01T00:00:00Z",
+            "dateUpdated": "2026-01-02T00:00:00Z",
+        },
+        "containers": {
+            "cna": {
+                "descriptions": [
+                    {"lang": "en", "value": "A cvelistV5 vulnerability."}
+                ],
+                "affected": [
+                    {
+                        "vendor": "Acme",
+                        "product": "Widget",
+                        "versions": [
+                            {
+                                "version": "1.0",
+                                "lessThan": "2.0",
+                                "status": "affected",
+                            }
+                        ],
+                    }
+                ],
+                "references": [
+                    {"url": "https://example.test/advisory", "name": "Advisory"}
+                ],
+            },
+            "adp": [],
+        },
+    }
+
+
 def response(payload: object) -> Mock:
     result = Mock()
     result.json.return_value = payload
     result.raise_for_status.return_value = None
+    return result
+
+
+def not_found_response() -> Mock:
+    result = Mock()
+    error = requests.HTTPError("not found")
+    error.response = Mock(status_code=404)
+    result.raise_for_status.side_effect = error
     return result
 
 
@@ -74,7 +120,7 @@ class NVDClientTests(unittest.TestCase):
                 response(
                     {"vulnerabilities": [{"cve": nvd_record("CVE-2026-1234")}]}
                 ),
-                response({"cveMetadata": {"cveId": "CVE-2026-5678"}}),
+                not_found_response(),
                 response({}),
                 response([]),
             ]
@@ -106,6 +152,8 @@ class NVDClientTests(unittest.TestCase):
             )
         )
         with patch.object(client, "_fetch_mitre_cve", return_value=None), patch.object(
+            client, "_fetch_cvelistv5_cve", return_value=None
+        ) as cvelist_fallback, patch.object(
             client, "_fetch_osv_cve", return_value=None
         ), patch.object(client, "_fetch_github_advisory", return_value=None), patch.object(
             client, "_fetch_redhat_cve", return_value=None
@@ -129,6 +177,7 @@ class NVDClientTests(unittest.TestCase):
                 "CISA KEV": "no_matching_record",
             },
         )
+        cvelist_fallback.assert_not_called()
 
     def test_upstream_error_tracks_each_provider_attempt_time(self):
         client = NVDClient()
@@ -251,6 +300,147 @@ class NVDClientTests(unittest.TestCase):
         )
         self.assertTrue(
             all(detail.get("last_checked_at") for detail in cve["source_details"])
+        )
+
+    def test_fetches_and_parses_cvelistv5_record(self):
+        client = NVDClient()
+        client.session.get = Mock(
+            return_value=response(cvelistv5_record("CVE-2026-1234"))
+        )
+
+        record = client._fetch_cvelistv5_cve("CVE-2026-1234")
+
+        self.assertEqual(
+            client.session.get.call_args.args[0],
+            CVELISTV5_RAW.format(
+                year="2026",
+                bucket="1xxx",
+                cve_id="CVE-2026-1234",
+            ),
+        )
+        self.assertEqual(record["description"], "A cvelistV5 vulnerability.")
+        self.assertEqual(
+            record["affected_systems"][0]["version_range"],
+            ">= 1.0, < 2.0",
+        )
+        self.assertEqual(record["refs"][0]["sources"], ["MITRE"])
+        self.assertEqual(
+            record["source_details"][0]["retrieval_path"],
+            "CVEProject/cvelistV5",
+        )
+        self.assertEqual(
+            record["source_records"][0]["claims"]["retrieval_path"],
+            "CVEProject/cvelistV5",
+        )
+
+    def test_cvelistv5_rejects_malformed_and_mismatched_records(self):
+        client = NVDClient()
+        client.session.get = Mock(
+            side_effect=[
+                response({"dataType": "CVE_RECORD", "containers": {}}),
+                response(cvelistv5_record("CVE-2026-5678")),
+            ]
+        )
+
+        with self.assertRaisesRegex(ValueError, "malformed"):
+            client._fetch_cvelistv5_cve("CVE-2026-1234")
+        with self.assertRaisesRegex(ValueError, "different CVE ID"):
+            client._fetch_cvelistv5_cve("CVE-2026-1234")
+
+    def test_cvelistv5_404_is_a_no_record_response(self):
+        client = NVDClient()
+        missing = Mock()
+        not_found = requests.HTTPError("not found")
+        not_found.response = Mock(status_code=404)
+        missing.raise_for_status.side_effect = not_found
+        client.session.get = Mock(return_value=missing)
+
+        self.assertIsNone(client._fetch_cvelistv5_cve("CVE-2026-1234"))
+
+    def test_uses_cvelistv5_only_after_mitre_api_error(self):
+        client = NVDClient()
+        client.session.get = Mock(
+            side_effect=[
+                response({"vulnerabilities": []}),
+                response(cvelistv5_record("CVE-2026-1234")),
+            ]
+        )
+        with patch.object(
+            client, "_fetch_mitre_cve", side_effect=requests.Timeout("MITRE timeout")
+        ), patch.object(client, "_fetch_osv_cve", return_value=None), patch.object(
+            client, "_fetch_github_advisory", return_value=None
+        ), patch.object(client, "_fetch_redhat_cve", return_value=None), patch.object(
+            client, "_fetch_cisa_kev", return_value=None
+        ), patch.object(client, "_collect_poc", return_value=[]):
+            cve = client.fetch_cve("CVE-2026-1234")
+
+        self.assertEqual(
+            client.session.get.call_args_list[1].args[0],
+            CVELISTV5_RAW.format(
+                year="2026",
+                bucket="1xxx",
+                cve_id="CVE-2026-1234",
+            ),
+        )
+        mitre_detail = next(
+            detail for detail in cve["source_details"] if detail["source"] == "MITRE/CNA"
+        )
+        self.assertEqual(mitre_detail["status"], "successful")
+        self.assertEqual(mitre_detail["retrieval_path"], "CVEProject/cvelistV5")
+        self.assertNotIn("MITRE", cve["source_warnings"])
+
+    def test_failed_cvelistv5_fallback_keeps_mitre_outcome_partial(self):
+        client = NVDClient()
+        client.session.get = Mock(
+            return_value=response(
+                {"vulnerabilities": [{"cve": nvd_record("CVE-2026-1234")}]}
+            )
+        )
+        with patch.object(
+            client, "_fetch_mitre_cve", side_effect=requests.Timeout("MITRE timeout")
+        ), patch.object(
+            client,
+            "_fetch_cvelistv5_cve",
+            side_effect=ValueError("Malformed CVE record."),
+        ), patch.object(client, "_fetch_osv_cve", return_value=None), patch.object(
+            client, "_fetch_github_advisory", return_value=None
+        ), patch.object(client, "_fetch_redhat_cve", return_value=None), patch.object(
+            client, "_fetch_cisa_kev", return_value=None
+        ), patch.object(client, "_collect_poc", return_value=[]):
+            cve = client.fetch_cve("CVE-2026-1234")
+
+        mitre_detail = next(
+            detail for detail in cve["source_details"] if detail["source"] == "MITRE"
+        )
+        self.assertEqual(mitre_detail["status"], "partial")
+        self.assertTrue(
+            any(warning.startswith("MITRE returned incomplete data") for warning in cve["source_warnings"])
+        )
+
+    def test_cvelistv5_not_found_after_mitre_error_is_unavailable(self):
+        client = NVDClient()
+        client.session.get = Mock(
+            return_value=response(
+                {"vulnerabilities": [{"cve": nvd_record("CVE-2026-1234")}]}
+            )
+        )
+        with patch.object(
+            client, "_fetch_mitre_cve", side_effect=requests.Timeout("MITRE timeout")
+        ), patch.object(
+            client, "_fetch_cvelistv5_cve", return_value=None
+        ), patch.object(client, "_fetch_osv_cve", return_value=None), patch.object(
+            client, "_fetch_github_advisory", return_value=None
+        ), patch.object(client, "_fetch_redhat_cve", return_value=None), patch.object(
+            client, "_fetch_cisa_kev", return_value=None
+        ), patch.object(client, "_collect_poc", return_value=[]):
+            cve = client.fetch_cve("CVE-2026-1234")
+
+        mitre_detail = next(
+            detail for detail in cve["source_details"] if detail["source"] == "MITRE"
+        )
+        self.assertEqual(mitre_detail["status"], "unavailable")
+        self.assertTrue(
+            any(warning.startswith("MITRE could not be reached") for warning in cve["source_warnings"])
         )
 
     def test_sync_pages_nvd_results_without_requesting_poc_data(self):

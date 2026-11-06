@@ -2,16 +2,16 @@
 
 **Developer/s:** Zayd Yaeesh
 
-**Vibe Check:** An app that combines CVE metadata from NVD and the MITRE CVE Program, including CISA assessments when supplied, and retrieves PoC references for registered users.
+**Vibe Check:** An app that combines CVE metadata from NVD and the MITRE CVE Program, including CISA assessments when supplied, and makes community PoC references available without accounts.
 
 ---
 
 ## 1. The Perimeter (Attack Surface)
 
-List the primary entry points of your application (e.g., login forms, API endpoints, file uploads, or URL parameters).
+List the primary entry points of your application (e.g., search inputs, API endpoints, file uploads, or URL parameters).
 
 - **Entry Point A:** The search bar (for entering in CVEs)
-- **Entry Point B:** Account registration/login endpoints.
+- **Entry Point B:** Public CVE lookup, refresh, and PoC reference API endpoints.
 
 ---
 
@@ -32,7 +32,7 @@ Detail the two specific security features required for the assignment.
 | Feature | Implementation Detail | Threat Mitigated |
 |---|---|---|
 | **Measure #1: Parameterized Queries** | Parameterized queries are used with "?"s as placeholders when users are querying the CVE database. | SQL Injection |
-| **Measure #2: Access Control** | Any PoC endpoint requires a "login_required" decorator and valid session tokens. | Broken Access Control |
+| **Measure #2: Request Protection** | Public lookup and PoC endpoints are rate-limited; browser state-changing requests require CSRF tokens. | Request forgery and excessive request abuse |
 
 ---
 
@@ -42,11 +42,9 @@ List any third-party libraries or frameworks used.
 
 - flask
 - flask-limiter
-- flask-login
 - flask-wtf
 - requests
 - bleach
-- bcrypt
 - apscheduler
 
 **Verification:** Did you check for known vulnerabilities in these packages (e.g., using npm audit or Snyk)?

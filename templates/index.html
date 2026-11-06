@@ -829,62 +829,6 @@ main {
   color: var(--text-muted);
 }
 
-/* Auth modal */
-.auth-modal {
-  position: fixed;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.56);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 200;
-}
-.auth-modal-content {
-  background: var(--bg-panel);
-  border: 1px solid var(--border);
-  border-radius: var(--r2);
-  padding: 20px;
-  width: min(420px, calc(100% - 32px));
-}
-.auth-modal-content h3 {
-  margin-bottom: 10px;
-  font-family: var(--font-display);
-  font-size: 1rem;
-}
-.auth-modal-content label {
-  display: block;
-  margin: 10px 0 4px;
-  color: var(--text-muted);
-  font-size: 0.78rem;
-}
-.auth-modal-content input {
-  width: 100%;
-  border: 1px solid var(--border);
-  border-radius: var(--r);
-  background: var(--bg-card);
-  color: var(--text);
-  padding: 8px 10px;
-  margin-bottom: 8px;
-}
-.auth-form-row {
-  display: flex;
-  gap: 8px;
-  margin-top: 8px;
-}
-.auth-form-row button {
-  flex: 1;
-  background: var(--bg-card);
-  border: 1px solid var(--border);
-  border-radius: var(--r);
-  color: var(--text);
-  padding: 8px;
-}
-.auth-message {
-  color: var(--text-muted);
-  margin-top: 8px;
-  min-height: 18px;
-}
-
 /* Severity color helpers for JS */
 .score-CRITICAL { color: var(--critical); }
 .score-HIGH     { color: var(--high); }
@@ -934,10 +878,6 @@ main {
     <div class="header-actions" id="headerActions">
       <div class="stat-chip" id="statTotal">DB: <b>—</b> CVEs</div>
       <div class="stat-chip" id="statCritical">Critical: <b style="color:var(--critical)">—</b></div>
-      <span class="stat-chip" id="userStatus">Not logged in</span>
-      <button class="btn-refresh" id="btnLogin" title="Login">🔐 Login</button>
-      <button class="btn-refresh" id="btnRegister" title="Register">✔ Register</button>
-      <button class="btn-refresh" id="btnLogout" title="Logout" style="display:none;">⇦ Logout</button>
     </div>
   </header>
 
@@ -986,23 +926,6 @@ main {
       <div id="errorState" style="display:none"></div>
     </div>
   </main>
-
-  <div id="authModal" class="auth-modal" style="display:none">
-    <div class="auth-modal-content">
-      <h3 id="authModalTitle">Login</h3>
-      <form id="authForm">
-        <label>Username</label>
-        <input id="authUsername" type="text" autocomplete="username" required minlength="3" maxlength="32" pattern="[a-zA-Z0-9]+" />
-        <label>Password</label>
-        <input id="authPassword" type="password" autocomplete="current-password" required minlength="8" />
-        <div class="auth-form-row">
-          <button type="submit" id="authSubmit">Submit</button>
-          <button type="button" id="authCancel">Cancel</button>
-        </div>
-      </form>
-      <p id="authMessage" class="auth-message"></p>
-    </div>
-  </div>
 
 </div>
 
@@ -1076,124 +999,6 @@ async function apiFetch(url, options = {}) {
   if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
   return data;
 }
-
-// ── Auth state ───────────────────────────────────────────
-let isAuthenticated = false;
-let currentUser = null;
-
-async function checkAuthStatus() {
-  try {
-    const status = await apiFetch('/api/auth/status');
-    isAuthenticated = status.authenticated;
-    currentUser = status.username || null;
-  } catch (err) {
-    isAuthenticated = false;
-    currentUser = null;
-  }
-  updateAuthUI();
-}
-
-function updateAuthUI() {
-  const userStatus = document.getElementById('userStatus');
-  const loginBtn  = document.getElementById('btnLogin');
-  const registerBtn = document.getElementById('btnRegister');
-  const logoutBtn = document.getElementById('btnLogout');
-  if (isAuthenticated) {
-    userStatus.textContent = `Signed in as ${currentUser}`;
-    loginBtn.style.display = 'none';
-    registerBtn.style.display = 'none';
-    logoutBtn.style.display = 'inline-flex';
-  } else {
-    userStatus.textContent = 'Not logged in';
-    loginBtn.style.display = 'inline-flex';
-    registerBtn.style.display = 'inline-flex';
-    logoutBtn.style.display = 'none';
-  }
-}
-
-const authModal = document.getElementById('authModal');
-const authModalTitle = document.getElementById('authModalTitle');
-const authForm = document.getElementById('authForm');
-const authUsername = document.getElementById('authUsername');
-const authPassword = document.getElementById('authPassword');
-const authSubmit = document.getElementById('authSubmit');
-const authCancel = document.getElementById('authCancel');
-const authMessage = document.getElementById('authMessage');
-
-let authMode = 'login';
-
-function openAuthModal(mode) {
-  authMode = mode;
-  authModal.style.display = 'flex';
-  authModalTitle.textContent = mode === 'login' ? 'User Login' : 'New User Registration';
-  authSubmit.textContent = mode === 'login' ? 'Log in' : 'Register';
-  authUsername.value = '';
-  authPassword.value = '';
-  authMessage.textContent = '';
-  authUsername.focus();
-}
-
-function closeAuthModal() {
-  authModal.style.display = 'none';
-}
-
-async function submitAuthForm(evt) {
-  evt.preventDefault();
-  authMessage.textContent = '';
-  const username = authUsername.value.trim();
-  const password = authPassword.value;
-  if (!username || !password) {
-    authMessage.textContent = 'Username and password are required.';
-    return;
-  }
-
-  try {
-    if (authMode === 'register') {
-      const data = await apiFetch('/api/register', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username, password }),
-      });
-      authMessage.textContent = 'Registration successful! Please log in.';
-      authMode = 'login';
-      authModalTitle.textContent = 'User Login';
-      authSubmit.textContent = 'Log in';
-      return;
-    }
-
-    const data = await apiFetch('/api/login', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username, password }),
-    });
-    authMessage.textContent = 'Login successful!';
-    closeAuthModal();
-    await checkAuthStatus();
-    loadCVE(activeCveId);
-  } catch (err) {
-    authMessage.textContent = err.message;
-  }
-}
-
-async function performLogout() {
-  try {
-    await apiFetch('/api/logout', { method: 'POST' });
-    isAuthenticated = false;
-    currentUser = null;
-    updateAuthUI();
-    loadCVE(activeCveId);
-  } catch (err) {
-    openAuthModal('login');
-    authMessage.textContent = err.message;
-  }
-}
-
-authForm.addEventListener('submit', submitAuthForm);
-authCancel.addEventListener('click', closeAuthModal);
-
-document.getElementById('btnLogin').addEventListener('click', () => openAuthModal('login'));
-document.getElementById('btnRegister').addEventListener('click', () => openAuthModal('register'));
-document.getElementById('btnLogout').addEventListener('click', performLogout);
 
 // ── States ───────────────────────────────────────────────
 function showLoading() {
@@ -1313,17 +1118,6 @@ async function renderPocContent(cveId, pocPanel) {
   warning.appendChild(warnText);
   pocPanel.appendChild(warning);
 
-  if (!isAuthenticated) {
-    const info = el('div', 'no-poc');
-    setText(info, 'Log in to fetch and view PoC data from the backend.');
-    const loginBtn = el('button', 'refresh-cve-btn');
-    setText(loginBtn, 'Login to view PoC');
-    loginBtn.addEventListener('click', () => openAuthModal('login'));
-    pocPanel.appendChild(info);
-    pocPanel.appendChild(loginBtn);
-    return;
-  }
-
   const loading = el('div','spinner-wrap');
   loading.innerHTML = '<div class="spinner"></div><div class="spinner-text">Loading PoC data...</div>';
   pocPanel.appendChild(loading);
@@ -1334,7 +1128,7 @@ async function renderPocContent(cveId, pocPanel) {
     pocPanel.removeChild(loading);
     if (!pocs.length) {
       const noExp = el('div', 'no-poc');
-      setText(noExp, 'No proof-of-concept exploits found for this CVE (or permission required).');
+      setText(noExp, 'No proof-of-concept references found for this CVE.');
       pocPanel.appendChild(noExp);
       return;
     }
@@ -1371,7 +1165,7 @@ async function renderPocContent(cveId, pocPanel) {
     });
   } catch (err) {
     pocPanel.removeChild(loading);
-    const noExp = el('div', 'no-poc'); setText(noExp, 'Unable to fetch PoC details. Please check you are logged in.'); pocPanel.appendChild(noExp);
+    const noExp = el('div', 'no-poc'); setText(noExp, 'Unable to fetch PoC details. Please try again later.'); pocPanel.appendChild(noExp);
   }
 }
 
@@ -1475,10 +1269,6 @@ function renderCVE(data) {
   const refreshBtn = el("button", "refresh-cve-btn");
   setText(refreshBtn, "↻ Refresh");
   refreshBtn.addEventListener("click", async () => {
-    if (!isAuthenticated) {
-      openAuthModal('login');
-      return;
-    }
     setText(refreshBtn, "Refreshing…");
     try {
       const fresh = await apiFetch(`/api/cve/${encodeURIComponent(data.id)}/refresh`, { method: 'POST' });
@@ -1981,7 +1771,6 @@ document.addEventListener("click", e => {
 
 // ── Init ─────────────────────────────────────────────────
 (function init() {
-  checkAuthStatus();
   loadRecent();
   loadStats();
 

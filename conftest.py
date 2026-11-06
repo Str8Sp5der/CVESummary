@@ -26,10 +26,3 @@ def csrf_token(client):
     )
     assert match
     return match.group(1)
-
-
-def authenticate(application, client, username="test-user"):
-    assert application.db.create_user(username, "unused-test-hash")
-    with client.session_transaction() as session:
-        session["_user_id"] = username
-        session["_fresh"] = True

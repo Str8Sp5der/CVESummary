@@ -4,6 +4,7 @@ nvd_client.py — NVD CVE API client with MITRE/OSV enrichment and PoC lookups
 Data sources:
   • NVD API 2.0    → CVE metadata, CVSS, affected systems
   • MITRE CVE API  → CNA/ADP metadata supplement and fallback
+  • CVEProject cvelistV5 → per-record fallback for MITRE API errors
   • OSV.dev        → ecosystem package and affected-version supplement
   • GitHub Advisories → reviewed/unreviewed package advisory supplement
   • ExploitDB     → JSON search endpoint for known exploits
@@ -22,6 +23,10 @@ log = logging.getLogger(__name__)
 
 NVD_API = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 MITRE_CVE_API = "https://cveawg.mitre.org/api/cve"
+CVELISTV5_RAW = (
+    "https://raw.githubusercontent.com/CVEProject/cvelistV5/main/"
+    "cves/{year}/{bucket}/{cve_id}.json"
+)
 OSV_API = "https://api.osv.dev/v1/vulns"
 GITHUB_ADVISORY_API = "https://api.github.com/advisories"
 REDHAT_CVE_API = "https://access.redhat.com/hydra/rest/securitydata/cve"
@@ -145,10 +150,29 @@ class NVDClient:
             mitre_record = self._fetch_mitre_cve(cve_id)
         except (requests.RequestException, ValueError) as exc:
             log.warning("MITRE CVE record lookup failed for %s: %s", cve_id, exc)
-            failed_sources.append("MITRE")
-            provider_outcomes["MITRE"] = (
-                "partial" if isinstance(exc, ValueError) else "unavailable"
-            )
+            try:
+                mitre_record = self._fetch_cvelistv5_cve(cve_id)
+            except (requests.RequestException, ValueError) as fallback_exc:
+                log.warning(
+                    "CVEProject cvelistV5 fallback failed for %s: %s",
+                    cve_id,
+                    fallback_exc,
+                )
+                failed_sources.append("MITRE")
+                provider_outcomes["MITRE"] = (
+                    "partial"
+                    if isinstance(exc, ValueError)
+                    or isinstance(fallback_exc, ValueError)
+                    else "unavailable"
+                )
+            else:
+                if mitre_record:
+                    provider_outcomes["MITRE"] = "successful"
+                else:
+                    failed_sources.append("MITRE")
+                    provider_outcomes["MITRE"] = (
+                        "partial" if isinstance(exc, ValueError) else "unavailable"
+                    )
         else:
             provider_outcomes["MITRE"] = (
                 "successful" if mitre_record else "no_matching_record"
@@ -621,10 +645,21 @@ class NVDClient:
         data = self._response_json(resp)
         if not data:
             return None
-        if data.get("cveMetadata", {}).get("cveId", "").upper() != cve_id.upper():
-            log.warning("MITRE returned no matching record for %s", cve_id)
-            return None
-        parsed = self._parse_mitre(data)
+        metadata = data.get("cveMetadata")
+        containers = data.get("containers")
+        if (
+            not isinstance(metadata, dict)
+            or not isinstance(containers, dict)
+            or not isinstance(containers.get("cna"), dict)
+            or not isinstance(containers.get("adp", []), list)
+        ):
+            raise ValueError("MITRE returned a malformed CVE record.")
+        if str(metadata.get("cveId", "")).upper() != cve_id.upper():
+            raise ValueError("MITRE returned a different CVE ID.")
+        try:
+            parsed = self._parse_mitre(data)
+        except (AttributeError, TypeError, KeyError) as exc:
+            raise ValueError("MITRE returned a malformed CVE record.") from exc
         parsed["source_records"] = [
             self._source_observation(
                 "MITRE",
@@ -633,6 +668,58 @@ class NVDClient:
                 source_updated_at=data.get("cveMetadata", {}).get("dateUpdated", ""),
                 trust_level="authoritative",
                 review_status=data.get("cveMetadata", {}).get("state", ""),
+            )
+        ]
+        return parsed
+
+    def _fetch_cvelistv5_cve(self, cve_id: str) -> dict | None:
+        match = re.fullmatch(r"CVE-(\d{4})-(\d{4,})", cve_id, re.IGNORECASE)
+        if not match:
+            raise ValueError("Invalid CVE ID for cvelistV5 lookup.")
+
+        year, number = match.groups()
+        bucket = f"{number[:-3]}xxx"
+        record_id = cve_id.upper()
+        url = CVELISTV5_RAW.format(
+            year=year,
+            bucket=bucket,
+            cve_id=record_id,
+        )
+        resp = self.session.get(url, timeout=15)
+        data = self._response_json(resp)
+        if data is None:
+            return None
+
+        metadata = data.get("cveMetadata")
+        containers = data.get("containers")
+        if (
+            data.get("dataType") != "CVE_RECORD"
+            or not isinstance(metadata, dict)
+            or not isinstance(containers, dict)
+            or not isinstance(containers.get("cna"), dict)
+            or not isinstance(containers.get("adp", []), list)
+        ):
+            raise ValueError("cvelistV5 returned a malformed CVE record.")
+        if str(metadata.get("cveId", "")).upper() != record_id:
+            raise ValueError("cvelistV5 returned a different CVE ID.")
+
+        try:
+            parsed = self._parse_mitre(data)
+        except (AttributeError, TypeError, KeyError) as exc:
+            raise ValueError("cvelistV5 returned a malformed CVE record.") from exc
+        for detail in parsed["source_details"]:
+            detail["retrieval_path"] = "CVEProject/cvelistV5"
+        parsed["source_records"] = [
+            self._source_observation(
+                "MITRE",
+                record_id,
+                data,
+                source_updated_at=metadata.get("dateUpdated", ""),
+                trust_level="authoritative",
+                review_status=metadata.get("state", ""),
+                claims={
+                    "retrieval_path": "CVEProject/cvelistV5",
+                },
             )
         ]
         return parsed
