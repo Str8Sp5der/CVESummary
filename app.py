@@ -13,6 +13,7 @@ Security hardening implemented:
 import os
 import re
 import logging
+import requests
 from datetime import datetime, timezone
 import bleach
 from flask import Flask, jsonify, request, render_template, abort
@@ -226,7 +227,9 @@ def get_cve(raw_id: str):
     cve_id = _validate_cve_id(raw_id)
 
     cached = db.get_cve(cve_id)
-    if cached and not nvd.cache_needs_refresh(cached):
+    if cached:
+        cached = _attach_epss_response(cached)
+    if cached and not nvd.cache_needs_refresh(cached) and cached.get("epss"):
         cached["cache"] = "HIT"
         return jsonify(cached)
     if request.method == "GET":
@@ -246,8 +249,6 @@ def get_cve(raw_id: str):
 
     try:
         fresh = nvd.fetch_cve(cve_id)
-        if fresh:
-            fresh = _enrich_with_epss(fresh)
     except CVEUpstreamError as exc:
         outcomes = exc.outcomes or {
             source: "unavailable" for source in exc.sources
