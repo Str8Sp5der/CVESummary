@@ -177,7 +177,61 @@ class NVDClientTests(unittest.TestCase):
                 "CISA KEV": "no_matching_record",
             },
         )
-        cvelist_fallback.assert_not_called()
+        cvelist_fallback.assert_called_once_with("CVE-2026-1234")
+
+    def test_falls_back_to_cvelistv5_when_mitre_api_has_no_record(self):
+        client = NVDClient()
+        client.session.get = Mock(
+            return_value=response(
+                {"vulnerabilities": [{"cve": nvd_record("CVE-2026-1234")}]}
+            )
+        )
+        with patch.object(client, "_fetch_mitre_cve", return_value=None), patch.object(
+            client,
+            "_fetch_cvelistv5_cve",
+            return_value=cvelistv5_record("CVE-2026-1234"),
+        ) as cvelist_fallback, patch.object(
+            client, "_fetch_osv_cve", return_value=None
+        ), patch.object(client, "_fetch_github_advisory", return_value=None), patch.object(
+            client, "_fetch_redhat_cve", return_value=None
+        ), patch.object(client, "_fetch_cisa_kev", return_value=None), patch.object(
+            client, "_collect_poc", return_value=[]
+        ):
+            cve = client.fetch_cve("CVE-2026-1234")
+
+        cvelist_fallback.assert_called_once_with("CVE-2026-1234")
+        self.assertEqual(cve["description"], "A test vulnerability.")
+        self.assertEqual(
+            next(
+                detail
+                for detail in cve["source_details"]
+                if detail["source"] == "MITRE/CNA"
+            )["status"],
+            "successful",
+        )
+        self.assertNotIn("MITRE", cve["source_warnings"])
+
+    def test_merge_uses_mitre_description_when_nvd_description_is_empty(self):
+        nvd = {
+            "id": "CVE-2026-1234",
+            "description": "",
+            "source": "NVD",
+            "affected_systems": [],
+            "refs": [],
+            "cwes": [],
+        }
+        mitre = {
+            "id": "CVE-2026-1234",
+            "description": "Description supplied by the CNA.",
+            "source": "MITRE",
+            "affected_systems": [],
+            "refs": [],
+            "cwes": [],
+        }
+
+        merged = NVDClient._merge_records(nvd, mitre)
+
+        self.assertEqual(merged["description"], "Description supplied by the CNA.")
 
     def test_upstream_error_tracks_each_provider_attempt_time(self):
         client = NVDClient()

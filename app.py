@@ -13,6 +13,7 @@ Security hardening implemented:
 import os
 import re
 import logging
+import requests
 from datetime import datetime, timezone
 import bleach
 from flask import Flask, jsonify, request, render_template, abort
@@ -25,6 +26,7 @@ from nvd_client import (
     CVEUpstreamError,
     NVDClient,
 )
+from epss_client import EPSSError, EPSSClient
 
 # ------------------------------------------------------------------ #
 # Logging                                                              #
@@ -58,6 +60,38 @@ nvd = NVDClient(
     api_key=os.environ.get("NVD_API_KEY"),
     github_token=os.environ.get("GITHUB_TOKEN"),
 )
+epss = EPSSClient()
+
+def _enrich_with_epss(record: dict) -> dict:
+    """Attach EPSS independently; a score outage must not fail CVE retrieval."""
+    try:
+        observation = epss.fetch(record["id"])
+    except (requests.RequestException, EPSSError) as exc:
+        log.warning("FIRST EPSS lookup failed for %s: %s", record["id"], exc)
+        observation = None
+        status = "partial" if isinstance(exc, EPSSError) else "unavailable"
+    else:
+        status = "successful" if observation else "no_matching_record"
+    record.setdefault("provider_updates", []).append("FIRST EPSS")
+    record.setdefault("sources_checked", []).append("FIRST EPSS")
+    record.setdefault("source_details", []).append({
+        "source": "FIRST EPSS", "status": status,
+        "trust_level": "authoritative", "untrusted": False,
+        "last_checked_at": datetime.now(timezone.utc).isoformat(),
+    })
+    if observation:
+        record.setdefault("source_records", []).append(observation)
+    return record
+
+def _attach_epss_response(record: dict) -> dict:
+    for observation in reversed(record.get("source_observations", [])):
+        if observation.get("source") == "FIRST EPSS":
+            claims = observation.get("claims") or {}
+            if "epss" in claims:
+                record["epss"] = claims
+                return record
+    record["epss"] = None
+    return record
 
 # ------------------------------------------------------------------ #
 # Background scheduler — update NVD every 6 hours                     #
@@ -193,7 +227,9 @@ def get_cve(raw_id: str):
     cve_id = _validate_cve_id(raw_id)
 
     cached = db.get_cve(cve_id)
-    if cached and not nvd.cache_needs_refresh(cached):
+    if cached:
+        cached = _attach_epss_response(cached)
+    if cached and not nvd.cache_needs_refresh(cached) and cached.get("epss"):
         cached["cache"] = "HIT"
         return jsonify(cached)
     if request.method == "GET":
@@ -334,8 +370,9 @@ def get_cve(raw_id: str):
             ),
         )
 
+    fresh = _enrich_with_epss(fresh)
     db.store_cve(fresh)
-    result = db.get_cve(cve_id)
+    result = _attach_epss_response(db.get_cve(cve_id))
     result["cache"] = "REFRESHED" if cached else "MISS"
     return jsonify(result)
 
